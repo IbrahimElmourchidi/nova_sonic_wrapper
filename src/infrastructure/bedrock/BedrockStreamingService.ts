@@ -106,6 +106,7 @@ export class BedrockStreamingService implements IStreamingService {
         sessionStart: { inferenceConfiguration: session.inferenceConfig },
       },
     });
+    session.isSessionStartSent = true;
   }
 
   enqueuePromptStart(sessionId: string): void {
@@ -162,6 +163,60 @@ export class BedrockStreamingService implements IStreamingService {
           interactive: false,
           role: "SYSTEM",
           textInputConfiguration: textConfig,
+        },
+      },
+    });
+
+    this.enqueue(sessionId, {
+      event: {
+        textInput: {
+          promptName: session.promptName,
+          contentName: contentId,
+          content,
+        },
+      },
+    });
+
+    this.enqueue(sessionId, {
+      event: {
+        contentEnd: {
+          promptName: session.promptName,
+          contentName: contentId,
+        },
+      },
+    });
+  }
+
+  enqueueUserText(sessionId: string, content: string): void {
+    const session = this.requireSession(sessionId);
+
+    // Nova Sonic requires audio content before text in the same prompt.
+    // If an audio block is open, close it first so the events are non-interleaved:
+    //   contentEnd(AUDIO) → contentStart(TEXT) → textInput → contentEnd(TEXT)
+    // Then endAudioContent in gracefulClose will skip (isAudioContentStartSent=false).
+    if (session.isAudioContentStartSent) {
+      this.enqueue(sessionId, {
+        event: {
+          contentEnd: {
+            promptName: session.promptName,
+            contentName: session.audioContentId,
+          },
+        },
+      });
+      session.isAudioContentStartSent = false;
+    }
+
+    const contentId = randomUUID();
+
+    this.enqueue(sessionId, {
+      event: {
+        contentStart: {
+          promptName: session.promptName,
+          contentName: contentId,
+          type: "TEXT",
+          interactive: false,
+          role: "USER",
+          textInputConfiguration: { mediaType: "text/plain" },
         },
       },
     });
@@ -434,10 +489,20 @@ export class BedrockStreamingService implements IStreamingService {
         }
       }
 
-      this.logger.info("Response stream complete", { sessionId });
-      this.dispatchEvent(sessionId, "streamComplete", {
-        timestamp: new Date().toISOString(),
-      });
+      // Only dispatch streamComplete if the session is still active (natural end).
+      // If session.isActive is false, the session was force-closed by gracefulClose.
+      // In that case a new session may already exist under the same socketId in the
+      // repository — dispatching here would wrongly trigger the NEW session's handler.
+      if (session.isActive) {
+        this.logger.info("Response stream complete", { sessionId });
+        this.dispatchEvent(sessionId, "streamComplete", {
+          timestamp: new Date().toISOString(),
+        });
+      } else {
+        this.logger.info("Response stream ended after session force-closed", {
+          sessionId,
+        });
+      }
     } catch (err) {
       this.logger.error("Error processing response stream", { sessionId, err });
       this.dispatchEvent(sessionId, "error", {

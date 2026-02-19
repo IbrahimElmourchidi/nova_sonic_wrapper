@@ -38,6 +38,12 @@ export interface IStreamingService {
   ): void;
 
   /**
+   * Enqueue a user text turn (role: USER, type: TEXT) to prompt the model
+   * to respond — used to trigger an AI greeting without requiring audio input.
+   */
+  enqueueUserText(sessionId: SessionId, content: string): void;
+
+  /**
    * Enqueue a raw audio chunk.
    */
   enqueueAudioChunk(sessionId: SessionId, audioData: Buffer): void;

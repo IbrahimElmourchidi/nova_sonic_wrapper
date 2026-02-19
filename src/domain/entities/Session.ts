@@ -19,8 +19,8 @@ export interface AudioContentId extends String {
 
 export interface SessionData {
   readonly sessionId: SessionId;
-  readonly promptName: string;
-  readonly audioContentId: string;
+  promptName: string;
+  audioContentId: string;
   readonly inferenceConfig: InferenceConfig;
   queue: Array<unknown>;
   readonly queueSignal: Subject<void>;
@@ -30,6 +30,7 @@ export interface SessionData {
   toolUseId: string;
   toolName: string;
   isActive: boolean;
+  isSessionStartSent: boolean;
   isPromptStartSent: boolean;
   isAudioContentStartSent: boolean;
   lastActivity: number;
@@ -53,6 +54,7 @@ export function createSessionData(
     toolUseId: "",
     toolName: "",
     isActive: true,
+    isSessionStartSent: false,
     isPromptStartSent: false,
     isAudioContentStartSent: false,
     lastActivity: Date.now(),

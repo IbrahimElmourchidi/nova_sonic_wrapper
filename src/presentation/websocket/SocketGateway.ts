@@ -79,6 +79,9 @@ export class SocketGateway {
     socket.on("audioStart", (data: unknown) =>
       this.handleAudioStart(socket, data)
     );
+    socket.on("userText", (data: unknown) =>
+      this.handleUserText(socket, data)
+    );
     socket.on("audioInput", (data: unknown) =>
       this.handleAudioInput(socket, data)
     );
@@ -178,7 +181,7 @@ export class SocketGateway {
   private async handlePromptStart(socket: Socket): Promise<void> {
     try {
       this.requireState(socket.id, [SessionState.ACTIVE, SessionState.READY]);
-      this.sessionUseCase.setupSessionAndPromptStart(socket.id);
+      this.sessionUseCase.startPrompt(socket.id);
     } catch (err) {
       this.logger.error("promptStart error", { socketId: socket.id, err });
       socket.emit("error", this.formatError(err));
@@ -219,6 +222,21 @@ export class SocketGateway {
     }
   }
 
+  private handleUserText(socket: Socket, rawData: unknown): void {
+    try {
+      this.requireState(socket.id, [SessionState.ACTIVE]);
+      const content =
+        typeof rawData === "string"
+          ? rawData
+          : (rawData as { content?: string })?.content ?? "";
+      if (!content) return;
+      this.sessionUseCase.sendUserText(socket.id, content);
+    } catch (err) {
+      this.logger.error("userText error", { socketId: socket.id, err });
+      socket.emit("error", this.formatError(err));
+    }
+  }
+
   private handleAudioInput(socket: Socket, rawData: unknown): void {
     try {
       const ctx = this.getContext(socket.id);
@@ -252,23 +270,19 @@ export class SocketGateway {
       return;
     }
 
-    ctx.cleanupInProgress = true;
-    ctx.state = SessionState.CLOSED;
+    // Stop accepting new audio input, but do NOT close the session.
+    // The Bedrock response stream is still running and will send audio back.
     this.audioStream.destroyQueue(socket.id);
 
     try {
-      await this.withTimeout(
-        this.gracefulClose(socket.id),
-        this.config.session.cleanupTimeoutMs,
-        "Session cleanup timeout"
-      );
-      socket.emit("sessionClosed");
+      await this.sessionUseCase.endAudioContent(socket.id);
+      await this.sessionUseCase.endPrompt(socket.id);
+      this.logger.info("stopAudio: input ended, waiting for AI response", {
+        socketId: socket.id,
+      });
     } catch (err) {
       this.logger.error("stopAudio error", { socketId: socket.id, err });
-      this.sessionUseCase.forceCloseSession(socket.id);
       socket.emit("error", this.formatError(err));
-    } finally {
-      ctx.cleanupInProgress = false;
     }
   }
 
@@ -332,8 +346,10 @@ export class SocketGateway {
 
     this.sessionUseCase.registerEventHandler(sessionId, "streamComplete", () => {
       socket.emit("streamComplete");
-      const ctx = this.getContext(socket.id);
-      if (ctx) ctx.state = SessionState.CLOSED;
+      this.logger.info("Turn complete, session stays alive", { socketId: socket.id });
+      // Re-initialize audio queue for the next turn's input
+      this.audioStream.initQueue(sessionId);
+      socket.emit("turnComplete");
     });
   }
 

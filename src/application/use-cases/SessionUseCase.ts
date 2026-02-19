@@ -80,6 +80,27 @@ export class SessionUseCase {
     this.logger.debug("Session + prompt start enqueued", { sessionId });
   }
 
+  /**
+   * Starts a new prompt within an existing session.
+   * Sends sessionStart only on the first call; resets prompt-level state each time.
+   */
+  startPrompt(sessionId: string): void {
+    const session = this.requireActiveSession(sessionId);
+
+    if (!session.isSessionStartSent) {
+      this.streaming.enqueueSessionStart(sessionId);
+    }
+
+    // Reset prompt-level state for the new turn
+    session.promptName = randomUUID();
+    session.audioContentId = randomUUID();
+    session.isPromptStartSent = false;
+    session.isAudioContentStartSent = false;
+
+    this.streaming.enqueuePromptStart(sessionId);
+    this.logger.debug("Prompt started", { sessionId, firstTurn: !session.isSessionStartSent });
+  }
+
   setupSystemPrompt(
     sessionId: string,
     request: SystemPromptRequest = { content: DefaultSystemPrompt }
@@ -88,6 +109,12 @@ export class SessionUseCase {
     const textConfig = request.textConfig ?? DefaultTextConfiguration;
     this.streaming.enqueueSystemPrompt(sessionId, request.content, textConfig);
     this.logger.debug("System prompt enqueued", { sessionId });
+  }
+
+  sendUserText(sessionId: string, content: string): void {
+    this.requireActiveSession(sessionId);
+    this.streaming.enqueueUserText(sessionId, content);
+    this.logger.debug("User text enqueued", { sessionId, content });
   }
 
   setupAudioStart(sessionId: string, dto: AudioStartDto = {}): void {
