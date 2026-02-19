@@ -1,0 +1,54 @@
+// src/infrastructure/logging/WinstonLogger.ts
+import "reflect-metadata";
+import { injectable } from "tsyringe";
+import winston from "winston";
+import type { ILogger } from "./ILogger";
+
+const { combine, timestamp, json, colorize, printf, errors } = winston.format;
+
+function createLogger(level: string, isProduction: boolean): winston.Logger {
+  const devFormat = combine(
+    errors({ stack: true }),
+    timestamp(),
+    colorize(),
+    printf(({ level, message, timestamp, ...meta }) => {
+      const metaStr = Object.keys(meta).length
+        ? " " + JSON.stringify(meta)
+        : "";
+      return `${timestamp} [${level}] ${message}${metaStr}`;
+    })
+  );
+
+  const prodFormat = combine(errors({ stack: true }), timestamp(), json());
+
+  return winston.createLogger({
+    level,
+    format: isProduction ? prodFormat : devFormat,
+    transports: [new winston.transports.Console()],
+  });
+}
+
+@injectable()
+export class WinstonLogger implements ILogger {
+  private readonly logger: winston.Logger;
+
+  constructor(level = "info", isProduction = false) {
+    this.logger = createLogger(level, isProduction);
+  }
+
+  error(message: string, meta?: Record<string, unknown>): void {
+    this.logger.error(message, meta);
+  }
+
+  warn(message: string, meta?: Record<string, unknown>): void {
+    this.logger.warn(message, meta);
+  }
+
+  info(message: string, meta?: Record<string, unknown>): void {
+    this.logger.info(message, meta);
+  }
+
+  debug(message: string, meta?: Record<string, unknown>): void {
+    this.logger.debug(message, meta);
+  }
+}

@@ -1,0 +1,1144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Nova Sonic — Test Client</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,700;1,400&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
+
+:root {
+  --bg:        #080b0f;
+  --surface:   #0d1117;
+  --panel:     #111820;
+  --border:    #1c2a38;
+  --border2:   #243040;
+  --green:     #00ff88;
+  --green-dim: #00cc6a;
+  --green-glow:#00ff8840;
+  --amber:     #ffb830;
+  --red:       #ff4455;
+  --blue:      #4ab8ff;
+  --cyan:      #00e5ff;
+  --text:      #8ba8c0;
+  --text-hi:   #c8dcea;
+  --muted:     #3a5068;
+  --scan:      rgba(0,255,136,.03);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  overflow: hidden;
+}
+
+/* CRT scanlines */
+body::after {
+  content: '';
+  position: fixed; inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    var(--scan) 2px,
+    var(--scan) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── Layout ─────────────────────────────────────────── */
+.shell {
+  display: grid;
+  grid-template-rows: 48px 1fr 160px;
+  grid-template-columns: 280px 1fr;
+  grid-template-areas:
+    "topbar topbar"
+    "sidebar main"
+    "footer  footer";
+  height: 100vh;
+  gap: 0;
+}
+
+/* ── Topbar ─────────────────────────────────────────── */
+.topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.topbar-logo {
+  font-family: 'IBM Plex Mono', monospace;
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--green);
+  letter-spacing: .12em;
+  text-shadow: 0 0 16px var(--green-glow);
+  flex-shrink: 0;
+}
+
+.topbar-logo span { color: var(--text); font-weight: 300; }
+
+.topbar-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex: 1;
+}
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: background .3s, box-shadow .3s;
+}
+.dot.green  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
+.dot.amber  { background: var(--amber);  box-shadow: 0 0 6px var(--amber); animation: blink .8s infinite; }
+.dot.red    { background: var(--red);    box-shadow: 0 0 6px var(--red); }
+
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+
+.btn-sm {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 5px 12px;
+  border-radius: 3px;
+  border: 1px solid var(--border2);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: all .15s;
+}
+.btn-sm:hover { background: var(--panel); border-color: var(--text); color: var(--text-hi); }
+.btn-sm.danger:hover { border-color: var(--red); color: var(--red); }
+
+/* ── Sidebar ─────────────────────────────────────────── */
+.sidebar {
+  grid-area: sidebar;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel-title {
+  font-size: 9px;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 14px 16px 8px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* Controls */
+.controls {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.btn {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  padding: 10px 14px;
+  border-radius: 4px;
+  border: 1px solid var(--border2);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: all .15s;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.btn:disabled { opacity: .35; cursor: not-allowed; }
+.btn-icon { font-size: 14px; }
+
+.btn-connect  { border-color: var(--green-dim); color: var(--green); }
+.btn-connect:hover:not(:disabled)  { background: rgba(0,255,136,.08); box-shadow: 0 0 12px var(--green-glow); }
+.btn-record   { border-color: var(--amber); color: var(--amber); }
+.btn-record:hover:not(:disabled)   { background: rgba(255,184,48,.08); }
+.btn-stop     { border-color: var(--red); color: var(--red); }
+.btn-stop:hover:not(:disabled)     { background: rgba(255,68,85,.08); }
+.btn-newchat  { border-color: var(--blue); color: var(--blue); }
+.btn-newchat:hover:not(:disabled)  { background: rgba(74,184,255,.08); }
+
+/* System prompt */
+.sys-prompt-wrap {
+  padding: 12px 16px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.sys-prompt-wrap label {
+  display: block;
+  font-size: 9px;
+  letter-spacing: .15em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.sys-prompt-wrap textarea {
+  width: 100%;
+  height: 80px;
+  background: var(--panel);
+  border: 1px solid var(--border2);
+  border-radius: 4px;
+  color: var(--text-hi);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  padding: 8px;
+  resize: none;
+  line-height: 1.5;
+  transition: border-color .15s;
+}
+.sys-prompt-wrap textarea:focus { outline: none; border-color: var(--cyan); }
+
+/* Metrics */
+.metrics {
+  padding: 12px 16px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+}
+
+.metric-key { font-size: 10px; color: var(--muted); letter-spacing: .06em; }
+
+.metric-val {
+  font-size: 11px;
+  color: var(--green);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* VU meter */
+.vu-wrap {
+  padding: 12px 16px;
+  flex-shrink: 0;
+}
+
+.vu-label { font-size: 9px; letter-spacing: .15em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+
+.vu-bar-track {
+  height: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+
+.vu-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--green) 0%, var(--amber) 75%, var(--red) 100%);
+  border-radius: 3px;
+  transition: width .05s linear;
+}
+
+/* ── Main ─────────────────────────────────────────── */
+.main {
+  grid-area: main;
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  overflow: hidden;
+}
+
+/* Transcript */
+.transcript-panel {
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.transcript-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.transcript-scroll::-webkit-scrollbar { width: 4px; }
+.transcript-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.msg {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 14px;
+  animation: fadeIn .25s ease;
+}
+
+@keyframes fadeIn { from { opacity:0; transform: translateY(4px); } to { opacity:1; transform:none; } }
+
+.msg-role {
+  font-size: 9px;
+  letter-spacing: .15em;
+  text-transform: uppercase;
+  padding-top: 2px;
+  flex-shrink: 0;
+  width: 62px;
+  text-align: right;
+  font-weight: 500;
+}
+.msg-role.user      { color: var(--amber); }
+.msg-role.assistant { color: var(--green); }
+.msg-role.system    { color: var(--cyan); }
+.msg-role.tool      { color: var(--blue); }
+
+.msg-content {
+  flex: 1;
+  line-height: 1.6;
+  color: var(--text-hi);
+  font-size: 13px;
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-weight: 300;
+}
+
+.msg-content.tool-content {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  color: var(--blue);
+  background: rgba(74,184,255,.06);
+  border: 1px solid rgba(74,184,255,.15);
+  border-radius: 4px;
+  padding: 8px 12px;
+}
+
+.thinking {
+  display: flex; gap: 4px; align-items: center; padding: 2px 0;
+}
+.thinking span {
+  width: 5px; height: 5px; border-radius: 50%; background: var(--green);
+  animation: bounce .8s infinite;
+}
+.thinking span:nth-child(2) { animation-delay: .15s; }
+.thinking span:nth-child(3) { animation-delay: .3s; }
+@keyframes bounce { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 8px;
+  color: var(--muted);
+}
+.empty-state .ascii {
+  font-size: 11px;
+  line-height: 1.4;
+  letter-spacing: .05em;
+  text-align: center;
+  opacity: .5;
+}
+.empty-state p { font-size: 11px; letter-spacing: .08em; }
+
+/* ── Event Log ─────────────────────────────────────── */
+.event-log-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.event-log-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.event-log-scroll::-webkit-scrollbar { width: 3px; }
+.event-log-scroll::-webkit-scrollbar-thumb { background: var(--border); }
+
+.log-entry {
+  display: flex;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 11px;
+  border-bottom: 1px solid rgba(28,42,56,.4);
+  animation: fadeIn .15s ease;
+}
+
+.log-ts  { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.log-dir { flex-shrink: 0; width: 14px; text-align: center; }
+.log-dir.in  { color: var(--green); }
+.log-dir.out { color: var(--amber); }
+.log-dir.sys { color: var(--cyan); }
+
+.log-event { flex-shrink: 0; width: 130px; }
+.log-event.e-textOutput    { color: var(--green); }
+.log-event.e-audioOutput   { color: var(--green-dim); }
+.log-event.e-contentStart  { color: var(--cyan); }
+.log-event.e-contentEnd    { color: var(--cyan); }
+.log-event.e-toolUse       { color: var(--blue); }
+.log-event.e-toolResult    { color: var(--blue); }
+.log-event.e-streamComplete{ color: var(--amber); }
+.log-event.e-error         { color: var(--red); }
+.log-event.e-audioInput    { color: var(--amber); }
+.log-event.e-sys           { color: var(--muted); }
+
+.log-payload { color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Footer / Waveform ─────────────────────────────── */
+.footer {
+  grid-area: footer;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: 280px 1fr;
+}
+
+.footer-left {
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 0 16px;
+  gap: 6px;
+}
+
+.footer-label {
+  font-size: 9px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.playback-status {
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: .05em;
+}
+
+.playback-status.playing { color: var(--green); animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+
+.footer-right {
+  position: relative;
+  overflow: hidden;
+}
+
+canvas#waveform {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Session state badge */
+.state-badge {
+  font-size: 9px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 2px;
+  border: 1px solid var(--muted);
+  color: var(--muted);
+  transition: all .2s;
+}
+.state-badge.active { border-color: var(--green); color: var(--green); }
+.state-badge.recording { border-color: var(--amber); color: var(--amber); }
+.state-badge.error { border-color: var(--red); color: var(--red); }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- Topbar -->
+  <header class="topbar">
+    <div class="topbar-logo">NOVA<span>SONIC</span></div>
+    <div class="topbar-sep"></div>
+    <div class="status-row">
+      <div class="status-pill">
+        <div class="dot" id="dot-socket"></div>
+        <span id="lbl-socket">disconnected</span>
+      </div>
+      <div class="status-pill">
+        <div class="dot" id="dot-session"></div>
+        <span id="lbl-session">no session</span>
+      </div>
+      <div class="status-pill">
+        <div class="dot" id="dot-mic"></div>
+        <span id="lbl-mic">mic off</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="state-badge" id="state-badge">idle</span>
+      <button class="btn-sm danger" id="btn-clear-log">clear log</button>
+    </div>
+  </header>
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="panel-title">// controls</div>
+
+    <div class="controls">
+      <button class="btn btn-connect" id="btn-connect">
+        <span class="btn-icon">◉</span> Connect
+      </button>
+      <button class="btn btn-record" id="btn-record" disabled>
+        <span class="btn-icon">⏺</span> Start Recording
+      </button>
+      <button class="btn btn-stop" id="btn-stop" disabled>
+        <span class="btn-icon">⏹</span> Stop
+      </button>
+      <button class="btn btn-newchat" id="btn-newchat" disabled>
+        <span class="btn-icon">↺</span> New Chat
+      </button>
+    </div>
+
+    <div class="sys-prompt-wrap">
+      <label>system prompt</label>
+      <textarea id="sys-prompt" spellcheck="false">You are a friend. The user and you will engage in a spoken dialog exchanging the transcripts of a natural real-time conversation. Keep your responses short, generally two or three sentences for chatty scenarios.</textarea>
+    </div>
+
+    <div class="metrics">
+      <div class="panel-title" style="padding:0 0 8px; border:none;">// metrics</div>
+      <div class="metric-row">
+        <span class="metric-key">chunks sent</span>
+        <span class="metric-val" id="m-chunks">0</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-key">audio rx</span>
+        <span class="metric-val" id="m-audio-rx">0 kb</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-key">events rx</span>
+        <span class="metric-val" id="m-events">0</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-key">session time</span>
+        <span class="metric-val" id="m-time">—</span>
+      </div>
+    </div>
+
+    <div class="vu-wrap">
+      <div class="vu-label">input level</div>
+      <div class="vu-bar-track"><div class="vu-bar-fill" id="vu-fill"></div></div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+
+    <!-- Transcript -->
+    <div class="transcript-panel">
+      <div class="panel-title">// transcript</div>
+      <div class="transcript-scroll" id="transcript">
+        <div class="empty-state" id="empty-state">
+          <pre class="ascii">  ___  ___
+ / _ \/ __| speech-to-speech
+| (_) \__ \   bidirectional
+ \___/|___/     test client</pre>
+          <p>connect → record → speak</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Event log -->
+    <div class="event-log-panel">
+      <div class="panel-title">// event log</div>
+      <div class="event-log-scroll" id="event-log"></div>
+    </div>
+
+  </main>
+
+  <!-- Footer / waveform -->
+  <footer class="footer">
+    <div class="footer-left">
+      <div class="footer-label">audio output</div>
+      <div class="audio-controls">
+        <span class="playback-status" id="playback-status">idle</span>
+      </div>
+      <div class="footer-label" id="audio-queue-lbl">queue: 0 chunks</div>
+    </div>
+    <div class="footer-right">
+      <canvas id="waveform"></canvas>
+    </div>
+  </footer>
+
+</div>
+
+<script>
+'use strict';
+
+// ── Config ───────────────────────────────────────────────────────────────────
+const SERVER_URL    = 'http://localhost:3000';
+const SAMPLE_RATE   = 16000;
+const CHUNK_MS      = 100;        // ms per audio chunk sent to server
+const OUTPUT_RATE   = 24000;      // Nova Sonic output sample rate
+
+// ── State ────────────────────────────────────────────────────────────────────
+let socket          = null;
+let sessionActive   = false;
+let isRecording     = false;
+let mediaStream     = null;
+let audioContext    = null;
+let scriptProcessor = null;
+let analyser        = null;
+let sessionStart    = null;
+let timerInterval   = null;
+
+// Audio output
+let audioCtxOut     = null;
+let audioQueue      = [];
+let isPlayingAudio  = false;
+let audioRxBytes    = 0;
+
+// Metrics
+let chunksSent      = 0;
+let eventsRx        = 0;
+
+// ── DOM refs ─────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const btnConnect   = $('btn-connect');
+const btnRecord    = $('btn-record');
+const btnStop      = $('btn-stop');
+const btnNewchat   = $('btn-newchat');
+const btnClearLog  = $('btn-clear-log');
+const sysPromptEl  = $('sys-prompt');
+const transcript   = $('transcript');
+const emptyState   = $('empty-state');
+const eventLog     = $('event-log');
+const canvas       = $('waveform');
+const ctx2d        = canvas.getContext('2d');
+
+// Status dots
+const dotSocket  = $('dot-socket');
+const dotSession = $('dot-session');
+const dotMic     = $('dot-mic');
+const lblSocket  = $('lbl-socket');
+const lblSession = $('lbl-session');
+const lblMic     = $('lbl-mic');
+const stateBadge = $('state-badge');
+
+// Metrics
+const mChunks   = $('m-chunks');
+const mAudioRx  = $('m-audio-rx');
+const mEvents   = $('m-events');
+const mTime     = $('m-time');
+const vuFill    = $('vu-fill');
+const pbStatus  = $('playback-status');
+const queueLbl  = $('audio-queue-lbl');
+
+// ── Waveform renderer ────────────────────────────────────────────────────────
+let waveData = new Float32Array(256).fill(0);
+let rafId;
+
+function resizeCanvas() {
+  canvas.width  = canvas.offsetWidth  * devicePixelRatio;
+  canvas.height = canvas.offsetHeight * devicePixelRatio;
+}
+
+function drawWaveform() {
+  rafId = requestAnimationFrame(drawWaveform);
+  resizeCanvas();
+  const W = canvas.width, H = canvas.height;
+  ctx2d.clearRect(0, 0, W, H);
+
+  // Grid lines
+  ctx2d.strokeStyle = 'rgba(28,42,56,.6)';
+  ctx2d.lineWidth = 1;
+  for (let x = 0; x < W; x += W/8) {
+    ctx2d.beginPath(); ctx2d.moveTo(x, 0); ctx2d.lineTo(x, H); ctx2d.stroke();
+  }
+  ctx2d.beginPath(); ctx2d.moveTo(0, H/2); ctx2d.lineTo(W, H/2); ctx2d.stroke();
+
+  // Pull live analyser data if recording
+  if (analyser) {
+    const buf = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(buf);
+    waveData = buf;
+
+    // VU
+    let peak = 0;
+    for (const s of buf) peak = Math.max(peak, Math.abs(s));
+    vuFill.style.width = Math.min(peak * 200, 100) + '%';
+  } else {
+    // Decay
+    vuFill.style.width = '0%';
+    waveData = waveData.map(v => v * 0.95);
+  }
+
+  // Draw wave
+  const step = W / waveData.length;
+  ctx2d.beginPath();
+  ctx2d.strokeStyle = isRecording ? 'rgba(0,255,136,.8)' : 'rgba(0,229,255,.5)';
+  ctx2d.lineWidth = 1.5 * devicePixelRatio;
+  ctx2d.shadowColor = isRecording ? '#00ff88' : '#00e5ff';
+  ctx2d.shadowBlur  = 6;
+  waveData.forEach((v, i) => {
+    const x = i * step;
+    const y = (0.5 + v * 0.45) * H;
+    i === 0 ? ctx2d.moveTo(x, y) : ctx2d.lineTo(x, y);
+  });
+  ctx2d.stroke();
+  ctx2d.shadowBlur = 0;
+}
+
+drawWaveform();
+window.addEventListener('resize', resizeCanvas);
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+function ts() {
+  return new Date().toISOString().slice(11, 23);
+}
+
+function logEvent(dir, event, payload = '') {
+  eventsRx++;
+  mEvents.textContent = eventsRx;
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+  const dirClass = dir === '←' ? 'in' : dir === '→' ? 'out' : 'sys';
+  const evClass  = 'e-' + (event.replace(/\s/g,'') || 'sys');
+  const payStr = typeof payload === 'object'
+    ? JSON.stringify(payload).slice(0, 120)
+    : String(payload).slice(0, 120);
+  entry.innerHTML = `
+    <span class="log-ts">${ts()}</span>
+    <span class="log-dir ${dirClass}">${dir}</span>
+    <span class="log-event ${evClass}">${event}</span>
+    <span class="log-payload">${payStr}</span>`;
+  eventLog.appendChild(entry);
+  eventLog.scrollTop = eventLog.scrollHeight;
+}
+
+function addMsg(role, content) {
+  if (emptyState) emptyState.remove();
+  const div = document.createElement('div');
+  div.className = 'msg';
+  const isTool = role === 'tool';
+  div.innerHTML = `
+    <span class="msg-role ${role}">${role}</span>
+    <div class="msg-content${isTool ? ' tool-content' : ''}">${content}</div>`;
+  transcript.appendChild(div);
+  transcript.scrollTop = transcript.scrollHeight;
+  return div;
+}
+
+let thinkingEl = null;
+function showThinking() {
+  if (thinkingEl) return;
+  thinkingEl = document.createElement('div');
+  thinkingEl.className = 'msg';
+  thinkingEl.innerHTML = `
+    <span class="msg-role assistant">assistant</span>
+    <div class="msg-content">
+      <div class="thinking"><span></span><span></span><span></span></div>
+    </div>`;
+  transcript.appendChild(thinkingEl);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function removeThinking() {
+  if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
+}
+
+function setStatus(dot, lbl, state, text) {
+  dot.className = 'dot ' + state;
+  lbl.textContent = text;
+}
+
+function setBadge(state, text) {
+  stateBadge.className = 'state-badge ' + state;
+  stateBadge.textContent = text;
+}
+
+function updateTimer() {
+  if (!sessionStart) { mTime.textContent = '—'; return; }
+  const s = Math.floor((Date.now() - sessionStart) / 1000);
+  const m = Math.floor(s / 60);
+  mTime.textContent = `${String(m).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+}
+
+function formatBytes(b) {
+  if (b < 1024) return b + ' b';
+  if (b < 1024*1024) return (b/1024).toFixed(1) + ' kb';
+  return (b/1024/1024).toFixed(1) + ' mb';
+}
+
+// ── Audio output (PCM playback) ───────────────────────────────────────────────
+function initAudioOut() {
+  if (!audioCtxOut) audioCtxOut = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: OUTPUT_RATE });
+}
+
+async function playAudioChunk(base64) {
+  initAudioOut();
+  const raw = atob(base64);
+  const pcm = new Int16Array(raw.length / 2);
+  for (let i = 0; i < pcm.length; i++) {
+    pcm[i] = (raw.charCodeAt(i*2)) | (raw.charCodeAt(i*2+1) << 8);
+  }
+  const float32 = new Float32Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) float32[i] = pcm[i] / 32768;
+
+  const buffer = audioCtxOut.createBuffer(1, float32.length, OUTPUT_RATE);
+  buffer.copyToChannel(float32, 0);
+  return buffer;
+}
+
+function enqueueAudio(base64) {
+  audioQueue.push(base64);
+  queueLbl.textContent = `queue: ${audioQueue.length} chunk${audioQueue.length !== 1 ? 's' : ''}`;
+
+  // Feed waveData from output buffer (visual only)
+  if (!isPlayingAudio) drainAudioQueue();
+}
+
+async function drainAudioQueue() {
+  if (isPlayingAudio || audioQueue.length === 0) return;
+  isPlayingAudio = true;
+  pbStatus.className = 'playback-status playing';
+  pbStatus.textContent = '▶ playing';
+
+  while (audioQueue.length > 0) {
+    const chunk = audioQueue.shift();
+    queueLbl.textContent = `queue: ${audioQueue.length} chunk${audioQueue.length !== 1 ? 's' : ''}`;
+    try {
+      const buffer = await playAudioChunk(chunk);
+      // Visualise output waveform
+      const ch = buffer.getChannelData(0);
+      waveData = ch.length > 256 ? ch.slice(0, 256) : ch;
+
+      await new Promise(resolve => {
+        const src = audioCtxOut.createBufferSource();
+        src.buffer = buffer;
+        src.connect(audioCtxOut.destination);
+        src.onended = resolve;
+        src.start();
+      });
+    } catch(e) { console.warn('Audio playback error', e); }
+  }
+
+  isPlayingAudio = false;
+  pbStatus.className = 'playback-status';
+  pbStatus.textContent = 'idle';
+  queueLbl.textContent = 'queue: 0 chunks';
+  waveData = new Float32Array(256).fill(0);
+}
+
+// ── Socket connection ─────────────────────────────────────────────────────────
+function connect() {
+  if (socket?.connected) return;
+
+  logEvent('◆', 'sys', `connecting to ${SERVER_URL}`);
+  socket = io(SERVER_URL, { transports: ['websocket'] });
+
+  socket.on('connect', () => {
+    setStatus(dotSocket, lblSocket, 'green', 'connected');
+    logEvent('◆', 'sys', `socket id: ${socket.id}`);
+    btnConnect.textContent = '◉ Connected';
+    btnConnect.disabled = true;
+    btnRecord.disabled = false;
+    btnNewchat.disabled = false;
+
+    // Initialize session
+    socket.emit('initializeConnection', (res) => {
+      if (res?.success) {
+        setStatus(dotSession, lblSession, 'green', 'session ready');
+        setBadge('active', 'ready');
+        logEvent('◆', 'sys', 'session initialized');
+        sessionStart = Date.now();
+        timerInterval = setInterval(updateTimer, 1000);
+        sessionActive = true;
+      } else {
+        logEvent('←', 'error', res?.error || 'init failed');
+        setStatus(dotSession, lblSession, 'red', 'init failed');
+        setBadge('error', 'error');
+      }
+    });
+  });
+
+  socket.on('disconnect', () => {
+    setStatus(dotSocket, lblSocket, 'red', 'disconnected');
+    setStatus(dotSession, lblSession, '', 'no session');
+    setStatus(dotMic, lblMic, '', 'mic off');
+    setBadge('', 'idle');
+    btnConnect.disabled = false;
+    btnConnect.textContent = '◉ Connect';
+    btnRecord.disabled = true;
+    btnStop.disabled = true;
+    btnNewchat.disabled = true;
+    sessionActive = false;
+    stopRecording();
+    logEvent('◆', 'sys', 'disconnected');
+    clearInterval(timerInterval);
+  });
+
+  socket.on('connect_error', (err) => {
+    logEvent('←', 'error', err.message);
+    setStatus(dotSocket, lblSocket, 'red', 'conn error');
+    setBadge('error', 'error');
+    btnConnect.disabled = false;
+  });
+
+  // ── Server events ────────────────────────────────────────────────────────
+
+  socket.on('audioReady', () => {
+    logEvent('←', 'audioReady', '');
+    setStatus(dotMic, lblMic, 'green', 'streaming');
+    setBadge('recording', 'streaming');
+  });
+
+  socket.on('contentStart', (data) => {
+    logEvent('←', 'contentStart', data);
+    if (data?.type === 'AUDIO') showThinking();
+  });
+
+  socket.on('textOutput', (data) => {
+    logEvent('←', 'textOutput', data?.content?.slice(0,80));
+    removeThinking();
+    if (data?.role === 'ASSISTANT' || data?.role === 'assistant') {
+      addMsg('assistant', escapeHtml(data.content));
+    } else if (data?.role === 'USER' || data?.role === 'user') {
+      addMsg('user', escapeHtml(data.content));
+    }
+  });
+
+  socket.on('audioOutput', (data) => {
+    if (!data?.content) return;
+    const bytes = Math.round(data.content.length * 3/4);
+    audioRxBytes += bytes;
+    mAudioRx.textContent = formatBytes(audioRxBytes);
+    logEvent('←', 'audioOutput', `${formatBytes(bytes)}`);
+    enqueueAudio(data.content);
+  });
+
+  socket.on('toolUse', (data) => {
+    logEvent('←', 'toolUse', `${data?.toolName}`);
+    addMsg('tool', `⚙ calling: <strong>${escapeHtml(data?.toolName)}</strong>`);
+  });
+
+  socket.on('toolResult', (data) => {
+    logEvent('←', 'toolResult', JSON.stringify(data?.result)?.slice(0,80));
+    addMsg('tool', `✓ result: ${escapeHtml(JSON.stringify(data?.result, null, 2))}`);
+  });
+
+  socket.on('contentEnd', (data) => {
+    logEvent('←', 'contentEnd', data?.type);
+    if (data?.type === 'AUDIO') removeThinking();
+  });
+
+  socket.on('streamComplete', () => {
+    logEvent('←', 'streamComplete', '');
+    removeThinking();
+    setBadge('', 'idle');
+    sessionActive = false;
+  });
+
+  socket.on('sessionClosed', () => {
+    logEvent('←', 'sessionClosed', '');
+    setStatus(dotSession, lblSession, '', 'closed');
+    setBadge('', 'idle');
+    sessionActive = false;
+    clearInterval(timerInterval);
+    sessionStart = null;
+    updateTimer();
+  });
+
+  socket.on('error', (data) => {
+    logEvent('←', 'error', data?.message || JSON.stringify(data));
+    setBadge('error', 'error');
+  });
+
+  socket.on('usageEvent', (data)    => logEvent('←', 'usageEvent', JSON.stringify(data)?.slice(0,80)));
+  socket.on('completionStart', (d)  => logEvent('←', 'completionStart', ''));
+}
+
+// ── Recording ────────────────────────────────────────────────────────────────
+async function startRecording() {
+  if (isRecording || !sessionActive) return;
+
+  try {
+    // 1. Prompt start + system prompt
+    socket.emit('promptStart');
+    logEvent('→', 'promptStart', '');
+    await delay(100);
+
+    socket.emit('systemPrompt', { content: sysPromptEl.value.trim() });
+    logEvent('→', 'systemPrompt', sysPromptEl.value.trim().slice(0, 60));
+    await delay(100);
+
+    socket.emit('audioStart', {});
+    logEvent('→', 'audioStart', '');
+
+    // 2. Get mic
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+
+    audioContext  = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+    const source  = audioContext.createMediaStreamSource(mediaStream);
+    analyser      = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+
+    // ScriptProcessor for PCM capture
+    scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+    source.connect(scriptProcessor);
+    scriptProcessor.connect(audioContext.destination);
+
+    let pcmBuffer = [];
+    const samplesPerChunk = Math.floor(SAMPLE_RATE * CHUNK_MS / 1000);
+
+    scriptProcessor.onaudioprocess = (e) => {
+      if (!isRecording) return;
+      const input = e.inputBuffer.getChannelData(0);
+      for (const s of input) pcmBuffer.push(s);
+
+      while (pcmBuffer.length >= samplesPerChunk) {
+        const chunk = pcmBuffer.splice(0, samplesPerChunk);
+        const pcm16 = new Int16Array(chunk.length);
+        for (let i = 0; i < chunk.length; i++) {
+          pcm16[i] = Math.max(-32768, Math.min(32767, chunk[i] * 32768));
+        }
+        const b64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer)));
+        socket.emit('audioInput', b64);
+        chunksSent++;
+        mChunks.textContent = chunksSent;
+        logEvent('→', 'audioInput', `chunk #${chunksSent} (${pcm16.byteLength}b)`);
+      }
+    };
+
+    isRecording = true;
+    setStatus(dotMic, lblMic, 'amber', 'capturing');
+    setBadge('recording', 'recording');
+    btnRecord.disabled = true;
+    btnStop.disabled   = false;
+    logEvent('◆', 'sys', 'mic capture started');
+
+  } catch(err) {
+    logEvent('←', 'error', err.message);
+    setBadge('error', 'mic error');
+    console.error(err);
+  }
+}
+
+async function stopRecording() {
+  if (!isRecording && !mediaStream) return;
+
+  isRecording = false;
+
+  if (scriptProcessor) { scriptProcessor.disconnect(); scriptProcessor = null; }
+  if (analyser)        { analyser.disconnect(); analyser = null; }
+  if (audioContext)    { await audioContext.close().catch(()=>{}); audioContext = null; }
+  if (mediaStream)     { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+
+  setStatus(dotMic, lblMic, '', 'mic off');
+
+  if (socket?.connected && sessionActive) {
+    socket.emit('stopAudio');
+    logEvent('→', 'stopAudio', '');
+    setBadge('', 'processing');
+    btnStop.disabled  = true;
+    btnRecord.disabled = false;
+  }
+}
+
+async function startNewChat() {
+  stopRecording();
+  audioQueue = [];
+  if (socket?.connected) {
+    socket.emit('startNewChat');
+    logEvent('◆', 'sys', 'new chat started');
+  }
+  // Re-init session
+  await delay(300);
+  if (socket?.connected) {
+    socket.emit('initializeConnection', (res) => {
+      if (res?.success) {
+        setStatus(dotSession, lblSession, 'green', 'session ready');
+        setBadge('active', 'ready');
+        sessionActive = true;
+        sessionStart = Date.now();
+        logEvent('◆', 'sys', 'session re-initialized');
+      }
+    });
+  }
+}
+
+// ── Button wiring ─────────────────────────────────────────────────────────────
+btnConnect.addEventListener('click', () => {
+  btnConnect.disabled = true;
+  connect();
+});
+
+btnRecord.addEventListener('click', startRecording);
+btnStop.addEventListener('click', stopRecording);
+btnNewchat.addEventListener('click', startNewChat);
+
+btnClearLog.addEventListener('click', () => {
+  eventLog.innerHTML = '';
+  eventsRx = 0;
+  mEvents.textContent = '0';
+});
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function escapeHtml(str = '') {
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/\n/g,'<br>');
+}
+
+// ── Init log ──────────────────────────────────────────────────────────────────
+logEvent('◆', 'sys', `client ready — server: ${SERVER_URL}`);
+logEvent('◆', 'sys', 'click Connect to begin');
+</script>
+</body>
+</html>
