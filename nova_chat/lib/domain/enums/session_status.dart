@@ -5,5 +5,8 @@ enum SessionStatus {
   recording,
   processing,
   aiSpeaking,
+  turnComplete,
+  waitingForPlayback,
   error,
+  closed,
 }

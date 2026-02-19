@@ -43,6 +43,10 @@ class ChatRepositoryImpl implements IChatRepository {
   Future<void> sendAudioStart() async => _dataSource.emitAudioStart();
 
   @override
+  Future<void> sendUserText(String content) async =>
+      _dataSource.emitUserText(content);
+
+  @override
   Future<void> sendAudioChunk(String base64Pcm) async =>
       _dataSource.emitAudioInput(base64Pcm);
 

@@ -38,6 +38,7 @@ dependencies:
   socket_io_client: ^3.1.4
   record: ^6.2.0
   just_audio: ^0.10.5
+  audio_session: ^0.1.25
   permission_handler: ^12.0.1
   path_provider: ^2.1.5
 

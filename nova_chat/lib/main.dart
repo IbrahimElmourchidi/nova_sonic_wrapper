@@ -1,9 +1,7 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_bloc/flutter_bloc.dart';
 
 import 'injection_container.dart';
-import 'presentation/cubit/chat_cubit.dart';
-import 'presentation/screens/chat_screen.dart';
+import 'presentation/screens/home_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -26,10 +24,7 @@ class NovaChatApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: BlocProvider(
-        create: (_) => sl<ChatCubit>(),
-        child: const ChatScreen(),
-      ),
+      home: const HomeScreen(),
     );
   }
 }

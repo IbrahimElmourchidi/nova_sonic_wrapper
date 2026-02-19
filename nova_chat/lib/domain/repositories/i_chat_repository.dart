@@ -14,6 +14,7 @@ abstract class IChatRepository {
   Future<void> sendPromptStart();
   Future<void> sendSystemPrompt(String content);
   Future<void> sendAudioStart();
+  Future<void> sendUserText(String content);
   Future<void> sendAudioChunk(String base64Pcm);
   Future<void> sendStopAudio();
   Future<void> disconnect();

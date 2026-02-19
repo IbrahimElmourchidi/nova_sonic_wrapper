@@ -8,14 +8,15 @@ class ChatState extends Equatable {
   final ConnectionStatus connectionStatus;
   final SessionStatus sessionStatus;
   final List<ChatMessage> messages;
-  final bool isRecording;
+  // true while connecting/requesting permissions before the first AI message
+  final bool isLoading;
   final String? errorMessage;
 
   const ChatState({
     this.connectionStatus = ConnectionStatus.disconnected,
     this.sessionStatus = SessionStatus.idle,
     this.messages = const [],
-    this.isRecording = false,
+    this.isLoading = true,
     this.errorMessage,
   });
 
@@ -23,14 +24,14 @@ class ChatState extends Equatable {
     ConnectionStatus? connectionStatus,
     SessionStatus? sessionStatus,
     List<ChatMessage>? messages,
-    bool? isRecording,
+    bool? isLoading,
     String? errorMessage,
   }) {
     return ChatState(
       connectionStatus: connectionStatus ?? this.connectionStatus,
       sessionStatus: sessionStatus ?? this.sessionStatus,
       messages: messages ?? this.messages,
-      isRecording: isRecording ?? this.isRecording,
+      isLoading: isLoading ?? this.isLoading,
       errorMessage: errorMessage,
     );
   }
@@ -40,7 +41,7 @@ class ChatState extends Equatable {
         connectionStatus,
         sessionStatus,
         messages,
-        isRecording,
+        isLoading,
         errorMessage,
       ];
 }

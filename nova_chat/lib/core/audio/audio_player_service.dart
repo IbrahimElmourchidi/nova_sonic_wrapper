@@ -2,12 +2,33 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:typed_data';
 
+import 'package:audio_session/audio_session.dart';
 import 'package:just_audio/just_audio.dart';
 
 class AudioPlayerService {
   final AudioPlayer _player = AudioPlayer();
   final Queue<Uint8List> _queue = Queue();
   bool _isPlaying = false;
+  bool _playbackSessionActive = false;
+
+  final _playbackComplete = StreamController<void>.broadcast();
+  Stream<void> get playbackCompleteStream => _playbackComplete.stream;
+
+  /// Whether more audio chunks are expected from the AI stream.
+  bool _expectingMore = false;
+
+  /// Call when AI audio stream starts (contentStart AUDIO ASSISTANT).
+  void markStreamActive() {
+    _expectingMore = true;
+  }
+
+  /// Call when AI audio stream is done (turnComplete received).
+  void markStreamDone() {
+    _expectingMore = false;
+    if (!_isPlaying && _queue.isEmpty) {
+      _onAllPlaybackDone();
+    }
+  }
 
   Future<void> enqueueChunk(List<int> pcmBytes) async {
     _queue.add(Uint8List.fromList(pcmBytes));
@@ -16,9 +37,49 @@ class AudioPlayerService {
     }
   }
 
+  /// Acquire transient audio focus before playback begins.
+  Future<void> _activatePlaybackSession() async {
+    if (_playbackSessionActive) return;
+    _playbackSessionActive = true;
+
+    final session = await AudioSession.instance;
+    await session.configure(const AudioSessionConfiguration(
+      avAudioSessionCategory: AVAudioSessionCategory.playback,
+      avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.defaultToSpeaker,
+      avAudioSessionMode: AVAudioSessionMode.spokenAudio,
+      avAudioSessionRouteSharingPolicy:
+          AVAudioSessionRouteSharingPolicy.defaultPolicy,
+      avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
+      androidAudioAttributes: AndroidAudioAttributes(
+        contentType: AndroidAudioContentType.speech,
+        flags: AndroidAudioFlags.none,
+        usage: AndroidAudioUsage.media,
+      ),
+      androidAudioFocusGainType: AndroidAudioFocusGainType.gainTransient,
+      androidWillPauseWhenDucked: true,
+    ));
+    await session.setActive(true);
+  }
+
+  /// Release audio focus so the recorder can capture mic input.
+  Future<void> _deactivatePlaybackSession() async {
+    if (!_playbackSessionActive) return;
+    _playbackSessionActive = false;
+
+    final session = await AudioSession.instance;
+    await session.setActive(false);
+  }
+
+  Future<void> _onAllPlaybackDone() async {
+    await _deactivatePlaybackSession();
+    _playbackComplete.add(null);
+  }
+
   Future<void> _drainQueue() async {
     if (_isPlaying || _queue.isEmpty) return;
     _isPlaying = true;
+
+    await _activatePlaybackSession();
 
     // Collect all available chunks into one buffer
     final allBytes = BytesBuilder();
@@ -44,6 +105,8 @@ class AudioPlayerService {
 
     if (_queue.isNotEmpty) {
       _drainQueue();
+    } else if (!_expectingMore) {
+      await _onAllPlaybackDone();
     }
   }
 
@@ -102,6 +165,7 @@ class AudioPlayerService {
   }
 
   void dispose() {
+    _playbackComplete.close();
     _player.dispose();
   }
 }

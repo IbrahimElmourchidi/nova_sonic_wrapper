@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
 import '../../domain/enums/connection_status.dart';
@@ -24,6 +25,7 @@ class SocketDataSource {
   Stream<String> get errorStream => _errors.stream;
 
   Future<bool> connect(String url) async {
+    debugPrint('[Socket] connect() → $url');
     final completer = Completer<bool>();
 
     _socket = io.io(
@@ -35,28 +37,37 @@ class SocketDataSource {
     );
 
     _socket!.onConnect((_) {
+      debugPrint('[Socket] ✅ connected  id=${_socket?.id}');
       _connectionStatus.add(ConnectionStatus.connected);
       if (!completer.isCompleted) completer.complete(true);
     });
 
     _socket!.onConnectError((err) {
+      debugPrint('[Socket] ❌ connect error: $err');
       _connectionStatus.add(ConnectionStatus.error);
       _errors.add('Connection error: $err');
       if (!completer.isCompleted) completer.complete(false);
     });
 
     _socket!.onDisconnect((_) {
+      debugPrint('[Socket] 🔌 disconnected');
       _connectionStatus.add(ConnectionStatus.disconnected);
+    });
+
+    _socket!.on('connect_error', (err) {
+      debugPrint('[Socket] connect_error event: $err');
     });
 
     _registerServerEvents();
 
     _connectionStatus.add(ConnectionStatus.connecting);
+    debugPrint('[Socket] calling _socket.connect()');
     _socket!.connect();
 
     return completer.future.timeout(
       const Duration(seconds: 10),
       onTimeout: () {
+        debugPrint('[Socket] ⏱ connect() timed out');
         _errors.add('Connection timeout');
         return false;
       },
@@ -64,43 +75,74 @@ class SocketDataSource {
   }
 
   Future<bool> initializeConnection() async {
+    debugPrint('[Socket] initializeConnection() → emitWithAck');
     final completer = Completer<bool>();
     _sessionStatus.add(SessionStatus.initializing);
 
-    _socket?.emitWithAck('initializeConnection', [], ack: (dynamic response) {
+    _socket?.emitWithAck('initializeConnection', null,
+        ack: (dynamic response) {
+      debugPrint('[Socket] initializeConnection ack → $response');
       if (response is Map && response['success'] == true) {
+        debugPrint('[Socket] ✅ session initialized');
         completer.complete(true);
       } else {
+        debugPrint('[Socket] ❌ init failed: $response');
         _sessionStatus.add(SessionStatus.error);
         _errors.add(response?.toString() ?? 'Init failed');
-        completer.complete(false);
+        if (!completer.isCompleted) completer.complete(false);
       }
     });
 
     return completer.future.timeout(
       const Duration(seconds: 10),
-      onTimeout: () => false,
+      onTimeout: () {
+        debugPrint('[Socket] ⏱ initializeConnection() ack timed out — ack never fired');
+        return false;
+      },
     );
   }
 
-  void emitPromptStart() => _socket?.emit('promptStart');
+  void emitStartNewChat() {
+    debugPrint('[Socket] → emit startNewChat');
+    _socket?.emit('startNewChat');
+  }
 
-  void emitSystemPrompt(String content) =>
-      _socket?.emit('systemPrompt', {'content': content});
+  void emitPromptStart() {
+    debugPrint('[Socket] → emit promptStart');
+    _socket?.emit('promptStart');
+  }
 
-  void emitAudioStart() => _socket?.emit('audioStart', {});
+  void emitSystemPrompt(String content) {
+    debugPrint('[Socket] → emit systemPrompt (${content.length} chars)');
+    _socket?.emit('systemPrompt', {'content': content});
+  }
+
+  void emitAudioStart() {
+    debugPrint('[Socket] → emit audioStart');
+    _socket?.emit('audioStart', {});
+  }
+
+  void emitUserText(String content) {
+    debugPrint('[Socket] → emit userText (${content.length} chars)');
+    _socket?.emit('userText', {'content': content});
+  }
 
   void emitAudioInput(String base64Pcm) =>
       _socket?.emit('audioInput', base64Pcm);
 
-  void emitStopAudio() => _socket?.emit('stopAudio');
+  void emitStopAudio() {
+    debugPrint('[Socket] → emit stopAudio');
+    _socket?.emit('stopAudio');
+  }
 
   void _registerServerEvents() {
     _socket?.on('audioReady', (_) {
+      debugPrint('[Socket] ← audioReady');
       _sessionStatus.add(SessionStatus.ready);
     });
 
     _socket?.on('contentStart', (data) {
+      debugPrint('[Socket] ← contentStart: $data');
       if (data is Map<String, dynamic>) {
         final type = data['type']?.toString().toUpperCase();
         final role = data['role']?.toString().toUpperCase();
@@ -111,6 +153,7 @@ class SocketDataSource {
     });
 
     _socket?.on('textOutput', (data) {
+      debugPrint('[Socket] ← textOutput: $data');
       if (data is Map<String, dynamic>) {
         final content = data['content'] as String?;
         if (content != null && content.isNotEmpty) {
@@ -120,6 +163,7 @@ class SocketDataSource {
     });
 
     _socket?.on('audioOutput', (data) {
+      debugPrint('[Socket] ← audioOutput (chunk received)');
       if (data is Map<String, dynamic>) {
         final content = data['content'] as String?;
         if (content != null) {
@@ -129,17 +173,35 @@ class SocketDataSource {
       }
     });
 
-    _socket?.on('contentEnd', (_) {});
+    _socket?.on('contentEnd', (data) {
+      debugPrint('[Socket] ← contentEnd: $data');
+    });
 
     _socket?.on('streamComplete', (_) {
+      debugPrint('[Socket] ← streamComplete');
       _sessionStatus.add(SessionStatus.idle);
+    });
+
+    _socket?.on('turnComplete', (_) {
+      debugPrint('[Socket] ← turnComplete');
+      _sessionStatus.add(SessionStatus.turnComplete);
     });
 
     _socket?.on('sessionClosed', (_) {
-      _sessionStatus.add(SessionStatus.idle);
+      debugPrint('[Socket] ← sessionClosed');
+      _sessionStatus.add(SessionStatus.closed);
+    });
+
+    _socket?.on('usageEvent', (data) {
+      debugPrint('[Socket] ← usageEvent: $data');
+    });
+
+    _socket?.on('completionStart', (_) {
+      debugPrint('[Socket] ← completionStart');
     });
 
     _socket?.on('error', (data) {
+      debugPrint('[Socket] ← error: $data');
       final message =
           data is Map ? data['message']?.toString() : data?.toString();
       _errors.add(message ?? 'Unknown error');
@@ -148,12 +210,14 @@ class SocketDataSource {
   }
 
   void disconnect() {
+    debugPrint('[Socket] disconnect()');
     _socket?.disconnect();
     _socket?.dispose();
     _socket = null;
   }
 
   void dispose() {
+    debugPrint('[Socket] dispose()');
     disconnect();
     _connectionStatus.close();
     _sessionStatus.close();
