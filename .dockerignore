@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+.gitignore
+*.md
+.vscode
+client/
+nova_chat/
+.env
+.env.*
+*.log
+.dockerfile
+deployGCP.sh
+lastSession.json

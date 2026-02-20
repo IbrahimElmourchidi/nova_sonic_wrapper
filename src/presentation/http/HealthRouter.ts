@@ -6,7 +6,7 @@ import type { Server as SocketServer } from "socket.io";
 
 import { TOKENS } from "../../infrastructure/config/tokens";
 import { SessionUseCase } from "../../application/use-cases/SessionUseCase";
-import type { HealthCheckResponse } from "../../application/dots/SessionDtos";
+import type { HealthCheckResponse } from "../../application/dtos/SessionDtos";
 
 @injectable()
 export class HealthRouter {

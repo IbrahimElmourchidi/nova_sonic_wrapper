@@ -13,7 +13,7 @@ import {
   InitializeSessionRequestSchema,
   SystemPromptRequestSchema,
   AudioStartSchema,
-} from "../../application/dots/SessionDtos";
+} from "../../application/dtos/SessionDtos";
 import { DomainError } from "../../domain/errors";
 import { resetStreamReady } from "../../domain/entities/Session";
 

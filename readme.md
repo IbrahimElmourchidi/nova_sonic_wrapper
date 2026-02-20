@@ -166,3 +166,18 @@ this.handlers = new Map([
 3. Add the `toolSpec` in `BedrockStreamingService.enqueuePromptStart()`.
 
 No other files change.
+
+
+gcloud run deploy nova-sonic-server \
+    --source . \
+    --region europe-west3 \
+    --set-secrets="AWS_ACCESS_KEY_ID=AWS_ACCESS_KEY_ID:latest,AWS_SECRET_ACCESS_KEY=AWS_SECRET_ACCESS_KEY:latest" \
+    --set-env-vars="AWS_REGION=us-east-1,NODE_ENV=production" \
+    --allow-unauthenticated \
+    --memory 512Mi \
+    --cpu 1 \
+    --concurrency 80 \
+    --timeout 300
+
+
+    gcloud run deploy nova-sonic-server     --source .     --region europe-west3     --set-secrets="AWS_ACCESS_KEY_ID=AWS_ACCESS_KEY_ID:latest,AWS_SECRET_ACCESS_KEY=AWS_SECRET_ACCESS_KEY:latest"     --set-env-vars="AWS_REGION=us-east-1,NODE_ENV=production"     --allow-unauthenticated     --memory 512Mi     --cpu 1     --concurrency 80     --timeout 300
