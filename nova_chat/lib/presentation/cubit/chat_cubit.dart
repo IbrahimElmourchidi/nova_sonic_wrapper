@@ -1,3 +1,4 @@
+// File: lib/presentation/cubit/chat_cubit.dart
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
@@ -26,11 +27,16 @@ class ChatCubit extends Cubit<ChatState> {
   StreamSubscription? _errorSub;
   StreamSubscription? _recorderSub;
   StreamSubscription? _playbackSub;
-  StreamSubscription? _vadSub; // NEW: VAD silence events
+  StreamSubscription? _vadSub;
 
   bool _greetingTriggered = false;
   bool _micStarting = false;
   String _systemPrompt = '';
+
+  // FIX: Track whether we have already opened the Nova Sonic stream with
+  // promptStart / systemPrompt / audioStart.  After the first turn the stream
+  // stays open for the entire session, so we must NEVER re-send those events.
+  bool _sessionStreamStarted = false;
 
   ChatCubit({
     required ConnectUseCase connectUseCase,
@@ -65,6 +71,8 @@ class ChatCubit extends Cubit<ChatState> {
       if (status == SessionStatus.aiSpeaking) {
         debugPrint('[Cubit] AI speaking → _stopMic()');
         _player.markStreamActive();
+        // FIX: _stopMic() now only stops the local recorder.
+        // It no longer emits stopAudio, so the server stream stays open.
         _stopMic();
       }
 
@@ -120,55 +128,77 @@ class ChatCubit extends Cubit<ChatState> {
     }
   }
 
-  /// Starts a new prompt within the existing session and begins recording.
-  /// VAD will automatically stop the turn when silence is detected.
   Future<void> _startNextTurn() async {
     debugPrint('[Cubit] _startNextTurn() called  micStarting=$_micStarting');
     if (isClosed || _micStarting) return;
     _micStarting = true;
 
     try {
-      debugPrint('[Cubit] _startNextTurn() → sendAudioUseCase.startNextTurn()');
-      final ok = await _sendAudioUseCase.startNextTurn(_systemPrompt);
-      if (!ok) {
+      // ── FIRST TURN ONLY: open the Nova Sonic stream ──────────────────────
+      //
+      // FIX: We only send promptStart / systemPrompt / audioStart ONCE for
+      // the entire conversation.  After that the stream stays alive on the
+      // server.  Sending these events again on a live stream is what caused
+      // the server to ignore them (they arrive on an already-open stream),
+      // which in turn caused audioReady to never fire → timeout.
+      //
+      if (!_sessionStreamStarted) {
         debugPrint(
-          '[Cubit] _startNextTurn() ❌ startNextTurn failed — aborting',
+          '[Cubit] _startNextTurn() first turn → startRecordingSession()',
         );
-        return;
-      }
-
-      debugPrint('[Cubit] _startNextTurn() → waiting for audioReady');
-      final readyStatus = await _repository.sessionStatusStream
-          .firstWhere((s) => s == SessionStatus.ready)
-          .timeout(
-            const Duration(seconds: 8),
-            onTimeout: () {
-              debugPrint(
-                '[Cubit] _startNextTurn() ⏱ timed out waiting for audioReady',
-              );
-              return SessionStatus.error;
-            },
+        final ok = await _sendAudioUseCase.startRecordingSession(_systemPrompt);
+        if (!ok) {
+          debugPrint(
+            '[Cubit] _startNextTurn() ❌ startRecordingSession failed — aborting',
           );
-      if (readyStatus == SessionStatus.error) return;
+          return;
+        }
+
+        // Wait for server to confirm the audio stream is ready.
+        // This only happens once — on the first turn.
+        debugPrint('[Cubit] _startNextTurn() → waiting for audioReady');
+        final readyStatus = await _repository.sessionStatusStream
+            .firstWhere((s) => s == SessionStatus.ready)
+            .timeout(
+              const Duration(seconds: 8),
+              onTimeout: () {
+                debugPrint(
+                  '[Cubit] _startNextTurn() ⏱ timed out waiting for audioReady',
+                );
+                return SessionStatus.error;
+              },
+            );
+        if (readyStatus == SessionStatus.error) return;
+
+        _sessionStreamStarted = true;
+        debugPrint('[Cubit] _startNextTurn() ✅ audioReady received');
+      } else {
+        // Subsequent turns: stream is already open, just restart the mic.
+        debugPrint(
+          '[Cubit] _startNextTurn() subsequent turn — stream already open, '
+          'restarting mic only',
+        );
+      }
 
       if (isClosed) return;
 
-      // Subscribe to VAD silence events BEFORE starting the recorder so we
-      // never miss the event in case the stream fires on the first tick.
+      // ── Start local recording (every turn) ───────────────────────────────
+
+      // Subscribe to VAD silence events BEFORE starting the recorder.
       _vadSub?.cancel();
       _vadSub = _recorder.silenceDetectedStream.listen((_) {
-        debugPrint('[Cubit] VAD silence detected → auto-stopping turn');
-        // Guard: only act if still recording; ignore stale events.
+        debugPrint('[Cubit] VAD silence detected → auto-stopping mic');
         if (!isClosed && state.sessionStatus == SessionStatus.recording) {
+          // FIX: _stopMic() only stops local recording — it does NOT emit
+          // stopAudio.  The server stream remains open and will respond
+          // based on the audio it received.
           _stopMic();
         }
       });
 
-      // Start physical recorder — VAD runs inside the recorder service.
       debugPrint('[Cubit] _startNextTurn() → recorder.startRecording()');
       await _recorder.startRecording();
 
-      // Subscribe to audio chunks and forward to socket.
       _recorderSub?.cancel();
       _recorderSub = _recorder.audioChunkStream.listen(
         (base64Chunk) {
@@ -190,8 +220,7 @@ class ChatCubit extends Cubit<ChatState> {
     }
   }
 
-  /// Called by the UI manual stop button (fallback in case VAD misses the
-  /// end of speech — e.g. very quiet environments or background noise).
+  /// Manual stop button fallback (in case VAD misses end of speech).
   Future<void> stopSpeaking() async {
     debugPrint('[Cubit] stopSpeaking() called — ending user turn manually');
     if (_recorderSub == null) {
@@ -201,24 +230,40 @@ class ChatCubit extends Cubit<ChatState> {
     await _stopMic();
   }
 
+  // FIX: _stopMic() now ONLY stops the local recorder.
+  //
+  // Previously it called _sendAudioUseCase.stopRecording() which emitted
+  // stopAudio to the server.  That told the server to tear down the
+  // bidirectional stream, making all subsequent turns impossible.
+  //
+  // The server stream must stay open until the whole conversation ends.
+  // stopAudio is sent only in close() via endSession().
+  //
   Future<void> _stopMic() async {
     debugPrint('[Cubit] _stopMic()  recorderSub=${_recorderSub != null}');
     if (_recorderSub == null) return;
 
-    // Cancel VAD subscription first to prevent double-fire.
+    // Cancel VAD first to prevent double-fire.
     await _vadSub?.cancel();
     _vadSub = null;
 
     await _recorderSub?.cancel();
     _recorderSub = null;
+
+    // Stop the hardware microphone.
     await _recorder.stopRecording();
-    await _sendAudioUseCase.stopRecording();
+
+    // FIX: DO NOT call _sendAudioUseCase.stopRecording() / sendStopAudio here.
+    // The server stream stays open.
+
     debugPrint('[Cubit] _stopMic() done');
   }
 
   @override
   Future<void> close() async {
     debugPrint('[Cubit] close()');
+
+    // Cancel all subscriptions first.
     _connectionSub?.cancel();
     _sessionSub?.cancel();
     _messageSub?.cancel();
@@ -227,7 +272,16 @@ class ChatCubit extends Cubit<ChatState> {
     _recorderSub?.cancel();
     _playbackSub?.cancel();
     _vadSub?.cancel();
+
+    // Stop local recording.
     await _recorder.stopRecording();
+
+    // FIX: Send stopAudio HERE — once, when the user truly ends the session.
+    // This is the correct and only place where the server stream should be closed.
+    if (_sessionStreamStarted) {
+      await _sendAudioUseCase.endSession();
+    }
+
     _recorder.dispose();
     _player.dispose();
     _repository.dispose();
