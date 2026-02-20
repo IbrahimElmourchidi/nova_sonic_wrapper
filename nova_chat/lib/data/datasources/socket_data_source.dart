@@ -1,3 +1,4 @@
+// File: lib/data/datasources/socket_data_source.dart
 import 'dart:async';
 import 'dart:convert';
 
@@ -132,7 +133,6 @@ class SocketDataSource {
     _socket?.emit('userText', {'content': content});
   }
 
-  // FIX: Added missing debug print so we can confirm chunks are actually being sent.
   void emitAudioInput(String base64Pcm) {
     debugPrint('[Socket] → emit audioInput (${base64Pcm.length} b64 chars)');
     _socket?.emit('audioInput', base64Pcm);
@@ -181,18 +181,43 @@ class SocketDataSource {
       }
     });
 
+    // FIX: contentEnd with stopReason END_TURN means the server has finished
+    // its response turn without us sending stopAudio.  Previously we ignored
+    // this event entirely, so turnComplete never arrived and the cubit never
+    // called markStreamDone() — leaving the app permanently stuck showing
+    // the speaker icon with the mic dead after the first AI response.
+    //
+    // Two cases to handle:
+    //   • stopReason == "END_TURN"   → server-initiated turn end (no stopAudio
+    //     was sent). Treat it exactly like a turnComplete event.
+    //   • stopReason == "PARTIAL_TURN" → stream is still open; a separate
+    //     turnComplete event will arrive shortly. Do nothing here.
+    //
     _socket?.on('contentEnd', (data) {
       debugPrint('[Socket] ← contentEnd: $data');
+      if (data is Map<String, dynamic>) {
+        final stopReason = data['stopReason']?.toString();
+        final type = data['type']?.toString().toUpperCase();
+
+        if (stopReason == 'END_TURN' && type == 'AUDIO') {
+          debugPrint(
+            '[Socket] ← contentEnd END_TURN on AUDIO → emitting turnComplete',
+          );
+          _sessionStatus.add(SessionStatus.turnComplete);
+        }
+      }
+    });
+
+    // turnComplete still fires when stopAudio was sent (e.g. on close()).
+    // Keep handling it so both paths work correctly.
+    _socket?.on('turnComplete', (_) {
+      debugPrint('[Socket] ← turnComplete');
+      _sessionStatus.add(SessionStatus.turnComplete);
     });
 
     _socket?.on('streamComplete', (_) {
       debugPrint('[Socket] ← streamComplete');
       _sessionStatus.add(SessionStatus.idle);
-    });
-
-    _socket?.on('turnComplete', (_) {
-      debugPrint('[Socket] ← turnComplete');
-      _sessionStatus.add(SessionStatus.turnComplete);
     });
 
     _socket?.on('sessionClosed', (_) {
