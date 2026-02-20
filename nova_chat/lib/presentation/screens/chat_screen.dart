@@ -41,8 +41,6 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      // Allow back navigation; cubit.close() is called automatically when the
-      // BlocProvider created in HomeScreen is removed from the widget tree.
       canPop: true,
       child: Scaffold(
         appBar: AppBar(
@@ -59,7 +57,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 final (icon, color) = switch (state.sessionStatus) {
                   SessionStatus.recording => (Icons.mic, Colors.red),
                   SessionStatus.aiSpeaking => (Icons.volume_up, Colors.blue),
-                  SessionStatus.processing => (Icons.hourglass_top, Colors.orange),
+                  SessionStatus.processing => (
+                    Icons.hourglass_top,
+                    Colors.orange,
+                  ),
                   _ => (Icons.mic_off, Colors.grey),
                 };
                 return Padding(
@@ -72,7 +73,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         body: Stack(
           children: [
-            // ── Chat messages ────────────────────────────────────────────
+            // ── Chat messages ──────────────────────────────────────────────
             BlocConsumer<ChatCubit, ChatState>(
               listenWhen: (p, c) => p.messages.length != c.messages.length,
               listener: (_, _) => _scrollToBottom(),
@@ -83,7 +84,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 }
                 return ListView.builder(
                   controller: _scrollController,
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 120),
                   itemCount: state.messages.length,
                   itemBuilder: (context, index) =>
                       MessageBubble(message: state.messages[index]),
@@ -91,7 +92,7 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
 
-            // ── Loading overlay (shown until first message arrives) ──────
+            // ── Loading overlay ────────────────────────────────────────────
             BlocBuilder<ChatCubit, ChatState>(
               buildWhen: (p, c) =>
                   p.isLoading != c.isLoading ||
@@ -99,7 +100,6 @@ class _ChatScreenState extends State<ChatScreen> {
                   p.sessionStatus != c.sessionStatus,
               builder: (context, state) {
                 if (!state.isLoading) return const SizedBox.shrink();
-
                 return Container(
                   color: Theme.of(context).colorScheme.surface,
                   child: Center(
@@ -117,6 +117,54 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                       ],
                     ),
+                  ),
+                );
+              },
+            ),
+
+            // ── Recording indicator + manual stop button ───────────────────
+            // VAD handles stop automatically. The button is a fallback for:
+            //   • Noisy environments where silence threshold is never crossed
+            //   • Very quiet speech that VAD doesn't detect
+            //   • Emulator/device microphone quirks
+            BlocBuilder<ChatCubit, ChatState>(
+              buildWhen: (p, c) => p.sessionStatus != c.sessionStatus,
+              builder: (context, state) {
+                if (state.sessionStatus != SessionStatus.recording) {
+                  return const SizedBox.shrink();
+                }
+                return Positioned(
+                  bottom: 24,
+                  left: 24,
+                  right: 24,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // VAD status hint
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: const Text(
+                          '🎙 Listening… will stop automatically when you pause',
+                          style: TextStyle(color: Colors.white, fontSize: 12),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      // Manual fallback button
+                      Center(
+                        child: _StopSpeakingButton(
+                          onPressed: () =>
+                              context.read<ChatCubit>().stopSpeaking(),
+                        ),
+                      ),
+                    ],
                   ),
                 );
               },
@@ -146,5 +194,53 @@ class _ChatScreenState extends State<ChatScreen> {
   void dispose() {
     _scrollController.dispose();
     super.dispose();
+  }
+}
+
+class _StopSpeakingButton extends StatefulWidget {
+  final VoidCallback onPressed;
+
+  const _StopSpeakingButton({required this.onPressed});
+
+  @override
+  State<_StopSpeakingButton> createState() => _StopSpeakingButtonState();
+}
+
+class _StopSpeakingButtonState extends State<_StopSpeakingButton>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _pulse,
+      builder: (context, child) =>
+          Transform.scale(scale: 1.0 + _pulse.value * 0.06, child: child),
+      child: FloatingActionButton.extended(
+        onPressed: widget.onPressed,
+        backgroundColor: Colors.red.shade700,
+        foregroundColor: Colors.white,
+        icon: const Icon(Icons.stop_rounded),
+        label: const Text(
+          'Done Speaking',
+          style: TextStyle(fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
   }
 }

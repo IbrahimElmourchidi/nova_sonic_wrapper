@@ -15,6 +15,7 @@ import {
   AudioStartSchema,
 } from "../../application/dots/SessionDtos";
 import { DomainError } from "../../domain/errors";
+import { resetStreamReady } from "../../domain/entities/Session";
 
 enum SessionState {
   CLOSED = "closed",
@@ -215,6 +216,13 @@ export class SocketGateway {
         socket.id,
         parsed.success ? parsed.data : {}
       );
+
+      // Wait for the Bedrock stream to be established before telling the client
+      // to proceed. Without this, fast clients (e.g. Flutter's auto-connect flow)
+      // can send all events before the stream is ready, causing 0 output tokens.
+      const session = this.sessionUseCase.getSession(socket.id);
+      await session.streamReady;
+
       socket.emit("audioReady");
     } catch (err) {
       this.logger.error("audioStart error", { socketId: socket.id, err });
@@ -346,9 +354,22 @@ export class SocketGateway {
 
     this.sessionUseCase.registerEventHandler(sessionId, "streamComplete", () => {
       socket.emit("streamComplete");
-      this.logger.info("Turn complete, session stays alive", { socketId: socket.id });
-      // Re-initialize audio queue for the next turn's input
+      this.logger.info("Turn complete, restarting stream for next turn", {
+        socketId: socket.id,
+      });
+
+      // Re-initialize audio queue for the next turn's mic input.
       this.audioStream.initQueue(sessionId);
+
+      // Reset streamReady for the next turn so audioReady waits for the new stream.
+      const session = this.sessionUseCase.getSession(sessionId);
+      resetStreamReady(session);
+
+      // The Bedrock bidirectional stream closes after every promptEnd/response
+      // cycle. Start a new stream that will drain whatever is already in the
+      // queue (or wait for the next signal).
+      this.sessionUseCase.startStream(sessionId);
+
       socket.emit("turnComplete");
     });
   }

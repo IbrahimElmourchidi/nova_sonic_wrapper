@@ -82,6 +82,8 @@ export class BedrockStreamingService implements IStreamingService {
         sessionId,
       });
 
+      session.resolveStreamReady();
+
       await this.processResponseStream(sessionId, response);
     } catch (err) {
       this.logger.error("Stream error", { sessionId, err });
@@ -384,11 +386,17 @@ export class BedrockStreamingService implements IStreamingService {
       };
     }
 
+    // Per-iterator flag so that return()/throw() only stop THIS iterator,
+    // not the entire session. Without this, the SDK calling return() on a
+    // finished stream would set session.isActive = false and kill the next
+    // stream's iterator too.
+    let aborted = false;
+
     return {
       [Symbol.asyncIterator]: () => ({
         next: async (): Promise<IteratorResult<InvokeModelWithBidirectionalStreamInput>> => {
           try {
-            if (!session.isActive || !this.sessions.has(sessionId)) {
+            if (aborted || !session.isActive || !this.sessions.has(sessionId)) {
               return { value: undefined as any, done: true };
             }
 
@@ -404,14 +412,14 @@ export class BedrockStreamingService implements IStreamingService {
               } catch (err) {
                 const isClose =
                   err instanceof Error && err.message === "Stream closed";
-                if (isClose || !session.isActive) {
+                if (isClose || aborted || !session.isActive) {
                   return { value: undefined as any, done: true };
                 }
                 this.logger.error("Unexpected race error", { sessionId, err });
               }
             }
 
-            if (session.queue.length === 0 || !session.isActive) {
+            if (aborted || session.queue.length === 0 || !session.isActive) {
               return { value: undefined as any, done: true };
             }
 
@@ -426,18 +434,18 @@ export class BedrockStreamingService implements IStreamingService {
             };
           } catch (err) {
             this.logger.error("Iterator error", { sessionId, err });
-            session.isActive = false;
+            aborted = true;
             return { value: undefined as any, done: true };
           }
         },
 
         return: async () => {
-          session.isActive = false;
+          aborted = true;
           return { value: undefined as any, done: true };
         },
 
         throw: async (err: unknown) => {
-          session.isActive = false;
+          aborted = true;
           throw err;
         },
       }),

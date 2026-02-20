@@ -79,24 +79,29 @@ class SocketDataSource {
     final completer = Completer<bool>();
     _sessionStatus.add(SessionStatus.initializing);
 
-    _socket?.emitWithAck('initializeConnection', null,
-        ack: (dynamic response) {
-      debugPrint('[Socket] initializeConnection ack → $response');
-      if (response is Map && response['success'] == true) {
-        debugPrint('[Socket] ✅ session initialized');
-        completer.complete(true);
-      } else {
-        debugPrint('[Socket] ❌ init failed: $response');
-        _sessionStatus.add(SessionStatus.error);
-        _errors.add(response?.toString() ?? 'Init failed');
-        if (!completer.isCompleted) completer.complete(false);
-      }
-    });
+    _socket?.emitWithAck(
+      'initializeConnection',
+      null,
+      ack: (dynamic response) {
+        debugPrint('[Socket] initializeConnection ack → $response');
+        if (response is Map && response['success'] == true) {
+          debugPrint('[Socket] ✅ session initialized');
+          completer.complete(true);
+        } else {
+          debugPrint('[Socket] ❌ init failed: $response');
+          _sessionStatus.add(SessionStatus.error);
+          _errors.add(response?.toString() ?? 'Init failed');
+          if (!completer.isCompleted) completer.complete(false);
+        }
+      },
+    );
 
     return completer.future.timeout(
       const Duration(seconds: 10),
       onTimeout: () {
-        debugPrint('[Socket] ⏱ initializeConnection() ack timed out — ack never fired');
+        debugPrint(
+          '[Socket] ⏱ initializeConnection() ack timed out — ack never fired',
+        );
         return false;
       },
     );
@@ -127,8 +132,11 @@ class SocketDataSource {
     _socket?.emit('userText', {'content': content});
   }
 
-  void emitAudioInput(String base64Pcm) =>
-      _socket?.emit('audioInput', base64Pcm);
+  // FIX: Added missing debug print so we can confirm chunks are actually being sent.
+  void emitAudioInput(String base64Pcm) {
+    debugPrint('[Socket] → emit audioInput (${base64Pcm.length} b64 chars)');
+    _socket?.emit('audioInput', base64Pcm);
+  }
 
   void emitStopAudio() {
     debugPrint('[Socket] → emit stopAudio');
@@ -202,8 +210,9 @@ class SocketDataSource {
 
     _socket?.on('error', (data) {
       debugPrint('[Socket] ← error: $data');
-      final message =
-          data is Map ? data['message']?.toString() : data?.toString();
+      final message = data is Map
+          ? data['message']?.toString()
+          : data?.toString();
       _errors.add(message ?? 'Unknown error');
       _sessionStatus.add(SessionStatus.error);
     });

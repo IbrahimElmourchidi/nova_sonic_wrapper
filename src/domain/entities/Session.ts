@@ -35,12 +35,26 @@ export interface SessionData {
   isAudioContentStartSent: boolean;
   lastActivity: number;
   status: SessionStatus;
+  streamReady: Promise<void>;
+  resolveStreamReady: () => void;
+}
+
+/** Resets the streamReady promise for a new Bedrock stream (called between turns). */
+export function resetStreamReady(session: SessionData): void {
+  let resolve!: () => void;
+  session.streamReady = new Promise<void>((r) => { resolve = r; });
+  session.resolveStreamReady = resolve;
 }
 
 export function createSessionData(
   sessionId: SessionId,
   inferenceConfig: InferenceConfig
 ): SessionData {
+  let resolveStreamReady!: () => void;
+  const streamReady = new Promise<void>((resolve) => {
+    resolveStreamReady = resolve;
+  });
+
   return {
     sessionId,
     promptName: randomUUID(),
@@ -59,5 +73,7 @@ export function createSessionData(
     isAudioContentStartSent: false,
     lastActivity: Date.now(),
     status: SessionStatus.INITIALIZING,
+    streamReady,
+    resolveStreamReady,
   };
 }

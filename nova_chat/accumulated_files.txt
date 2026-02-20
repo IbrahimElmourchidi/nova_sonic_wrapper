@@ -1,4 +1,4 @@
-// File: core\audio\audio_player_service.dart (5687 bytes)
+// File: lib\core\audio\audio_player_service.dart (5687 bytes)
 import 'dart:async';
 import 'dart:collection';
 import 'dart:typed_data';
@@ -193,68 +193,203 @@ class _WavAudioSource extends StreamAudioSource {
 
 //------------------------------------------------------------------------------
 
-// File: core\audio\audio_recorder_service.dart (1586 bytes)
+// File: lib\core\audio\audio_recorder_service.dart (7562 bytes)
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:record/record.dart';
 
+/// Simple energy-based Voice Activity Detector.
+///
+/// State machine:
+///   WAITING_FOR_SPEECH  →  (RMS > speechThreshold)  →  IN_SPEECH
+///   IN_SPEECH           →  (RMS < silenceThreshold for silenceChunks) → SILENCE_DETECTED
+///
+/// Once SILENCE_DETECTED fires, [silenceDetectedStream] emits one event
+/// and the VAD resets so it can be reused on the next turn.
 class AudioRecorderService {
   final AudioRecorder _recorder = AudioRecorder();
   StreamSubscription<List<int>>? _recordSubscription;
   final _chunkController = StreamController<String>.broadcast();
+  final _silenceController = StreamController<void>.broadcast();
 
+  // ── VAD tunables ──────────────────────────────────────────────────────────
+
+  /// RMS value (0–32768) above which audio is considered speech.
+  static const int _speechThreshold = 300;
+
+  /// RMS value below which audio is considered silence.
+  /// Slightly lower than speech threshold to create hysteresis.
+  static const int _silenceThreshold = 200;
+
+  /// How many consecutive silent chunks must follow speech before we declare
+  /// the turn over.  Each chunk ≈ 60 ms at 16 kHz/16-bit/mono (960 samples).
+  /// 25 chunks × 60 ms = 1 500 ms of trailing silence.
+  static const int _silenceChunksRequired = 25;
+
+  /// Minimum number of speech chunks required before silence detection can
+  /// trigger. Prevents firing on a quiet environment before the user speaks.
+  /// 5 chunks × 60 ms = 300 ms of speech required.
+  static const int _minSpeechChunks = 5;
+
+  // ── VAD state ─────────────────────────────────────────────────────────────
+  bool _hasSpeech = false;
+  int _silenceCount = 0;
+  int _speechCount = 0;
+  int _chunkCount = 0;
+
+  // ── Public streams ────────────────────────────────────────────────────────
+
+  /// Base64-encoded PCM chunks as they arrive from the microphone.
   Stream<String> get audioChunkStream => _chunkController.stream;
 
-  Future<bool> hasPermission() async {
-    return await _recorder.hasPermission();
-  }
+  /// Fires once when VAD determines the user has finished speaking.
+  Stream<void> get silenceDetectedStream => _silenceController.stream;
+
+  // ── Public API ────────────────────────────────────────────────────────────
+
+  Future<bool> hasPermission() => _recorder.hasPermission();
 
   Future<void> startRecording() async {
+    _resetVad();
+    _chunkCount = 0;
+
     try {
       debugPrint('[AudioRecorder] startRecording()');
+      debugPrint(
+        '[VAD] thresholds: speech>=$_speechThreshold  silence<$_silenceThreshold  '
+        'need $_silenceChunksRequired silent chunks after $_minSpeechChunks speech chunks',
+      );
+
       final stream = await _recorder.startStream(
         const RecordConfig(
           encoder: AudioEncoder.pcm16bits,
           sampleRate: 16000,
           numChannels: 1,
-          autoGain: true,
-          echoCancel: true,
-          noiseSuppress: true,
+          autoGain: false,
+          echoCancel: false,
+          noiseSuppress: false,
         ),
       );
 
       _recordSubscription = stream.listen(
-        (data) {
-          final base64Chunk = base64Encode(Uint8List.fromList(data));
-          _chunkController.add(base64Chunk);
+        _onChunk,
+        onError: (Object e, StackTrace st) {
+          debugPrint('[AudioRecorder] stream error: $e\n$st');
         },
-        onError: (e) => debugPrint('[AudioRecorder] stream error: $e'),
+        onDone: () {
+          debugPrint('[AudioRecorder] stream done  totalChunks=$_chunkCount');
+        },
+        cancelOnError: false,
       );
-      debugPrint('[AudioRecorder] stream active');
-    } catch (e) {
-      debugPrint('[AudioRecorder] failed to start: $e');
+
+      debugPrint('[AudioRecorder] stream active — watching RMS levels:');
+    } catch (e, st) {
+      debugPrint('[AudioRecorder] failed to start: $e\n$st');
     }
   }
 
   Future<void> stopRecording() async {
+    debugPrint('[AudioRecorder] stopRecording()  totalChunks=$_chunkCount');
     await _recordSubscription?.cancel();
     _recordSubscription = null;
     await _recorder.stop();
+    _resetVad();
   }
 
   void dispose() {
     _recordSubscription?.cancel();
     _chunkController.close();
+    _silenceController.close();
     _recorder.dispose();
+  }
+
+  // ── Internal ──────────────────────────────────────────────────────────────
+
+  void _resetVad() {
+    _hasSpeech = false;
+    _silenceCount = 0;
+    _speechCount = 0;
+  }
+
+  void _onChunk(List<int> data) {
+    if (_chunkController.isClosed) return;
+
+    _chunkCount++;
+
+    // Forward raw audio to the socket stream immediately.
+    _chunkController.add(base64Encode(Uint8List.fromList(data)));
+
+    // ── VAD logic ─────────────────────────────────────────────────────────
+    final rms = _computeRms(data);
+
+    // ASCII level bar: each filled block = 200 RMS units, 20 chars wide.
+    // At RMS=300 (speech threshold) you will see 1-2 filled blocks.
+    // Normal speech is typically RMS 500-3000 (3-15 filled blocks).
+    final barLen = (rms / 200).clamp(0, 20).toInt();
+    final bar = ('${'█' * barLen}${'░' * (20 - barLen)}');
+
+    // Human-readable VAD state label for this chunk.
+    final String vadState;
+    if (!_hasSpeech) {
+      vadState = 'WAITING  need rms>=$_speechThreshold to start';
+    } else if (rms >= _speechThreshold) {
+      vadState = 'SPEECH   silence reset  total=$_speechCount';
+    } else if (rms < _silenceThreshold) {
+      vadState = 'SILENCE  $_silenceCount/$_silenceChunksRequired';
+    } else {
+      vadState = 'HOLD     between thresholds';
+    }
+
+    // Print every single chunk so you can see real-time levels.
+    debugPrint(
+      '[VAD #${_chunkCount.toString().padLeft(4)}] '
+      'rms=${rms.toString().padLeft(5)}  |$bar|  $vadState',
+    );
+
+    // ── State transitions ──────────────────────────────────────────────────
+    if (rms >= _speechThreshold) {
+      _hasSpeech = true;
+      _speechCount++;
+      _silenceCount = 0;
+    } else if (rms < _silenceThreshold && _hasSpeech) {
+      _silenceCount++;
+
+      if (_speechCount >= _minSpeechChunks &&
+          _silenceCount >= _silenceChunksRequired) {
+        debugPrint(
+          '[VAD] ✅ END OF SPEECH  speechChunks=$_speechCount  '
+          'silentChunks=$_silenceCount — firing silenceDetectedStream',
+        );
+        _resetVad();
+        if (!_silenceController.isClosed) {
+          _silenceController.add(null);
+        }
+      }
+    }
+    // RMS between thresholds while _hasSpeech → hysteresis, no state change.
+  }
+
+  /// Compute the Root Mean Square energy of a 16-bit little-endian PCM buffer.
+  int _computeRms(List<int> data) {
+    if (data.length < 2) return 0;
+    final bytes = Uint8List.fromList(data);
+    final samples = bytes.buffer.asInt16List();
+    double sum = 0;
+    for (final sample in samples) {
+      sum += sample * sample;
+    }
+    return math.sqrt(sum / samples.length).round();
   }
 }
 
 
 //------------------------------------------------------------------------------
 
-// File: core\constants.dart (676 bytes)
+// File: lib\core\constants.dart (676 bytes)
 class AppConstants {
   AppConstants._();
 
@@ -278,7 +413,7 @@ class AppConstants {
 
 //------------------------------------------------------------------------------
 
-// File: data\datasources\socket_data_source.dart (7180 bytes)
+// File: lib\data\datasources\socket_data_source.dart (7426 bytes)
 import 'dart:async';
 import 'dart:convert';
 
@@ -360,24 +495,29 @@ class SocketDataSource {
     final completer = Completer<bool>();
     _sessionStatus.add(SessionStatus.initializing);
 
-    _socket?.emitWithAck('initializeConnection', null,
-        ack: (dynamic response) {
-      debugPrint('[Socket] initializeConnection ack → $response');
-      if (response is Map && response['success'] == true) {
-        debugPrint('[Socket] ✅ session initialized');
-        completer.complete(true);
-      } else {
-        debugPrint('[Socket] ❌ init failed: $response');
-        _sessionStatus.add(SessionStatus.error);
-        _errors.add(response?.toString() ?? 'Init failed');
-        if (!completer.isCompleted) completer.complete(false);
-      }
-    });
+    _socket?.emitWithAck(
+      'initializeConnection',
+      null,
+      ack: (dynamic response) {
+        debugPrint('[Socket] initializeConnection ack → $response');
+        if (response is Map && response['success'] == true) {
+          debugPrint('[Socket] ✅ session initialized');
+          completer.complete(true);
+        } else {
+          debugPrint('[Socket] ❌ init failed: $response');
+          _sessionStatus.add(SessionStatus.error);
+          _errors.add(response?.toString() ?? 'Init failed');
+          if (!completer.isCompleted) completer.complete(false);
+        }
+      },
+    );
 
     return completer.future.timeout(
       const Duration(seconds: 10),
       onTimeout: () {
-        debugPrint('[Socket] ⏱ initializeConnection() ack timed out — ack never fired');
+        debugPrint(
+          '[Socket] ⏱ initializeConnection() ack timed out — ack never fired',
+        );
         return false;
       },
     );
@@ -408,8 +548,11 @@ class SocketDataSource {
     _socket?.emit('userText', {'content': content});
   }
 
-  void emitAudioInput(String base64Pcm) =>
-      _socket?.emit('audioInput', base64Pcm);
+  // FIX: Added missing debug print so we can confirm chunks are actually being sent.
+  void emitAudioInput(String base64Pcm) {
+    debugPrint('[Socket] → emit audioInput (${base64Pcm.length} b64 chars)');
+    _socket?.emit('audioInput', base64Pcm);
+  }
 
   void emitStopAudio() {
     debugPrint('[Socket] → emit stopAudio');
@@ -483,8 +626,9 @@ class SocketDataSource {
 
     _socket?.on('error', (data) {
       debugPrint('[Socket] ← error: $data');
-      final message =
-          data is Map ? data['message']?.toString() : data?.toString();
+      final message = data is Map
+          ? data['message']?.toString()
+          : data?.toString();
       _errors.add(message ?? 'Unknown error');
       _sessionStatus.add(SessionStatus.error);
     });
@@ -511,7 +655,7 @@ class SocketDataSource {
 
 //------------------------------------------------------------------------------
 
-// File: data\models\chat_message_model.dart (652 bytes)
+// File: lib\data\models\chat_message_model.dart (652 bytes)
 import '../../domain/entities/chat_message.dart';
 
 class ChatMessageModel extends ChatMessage {
@@ -536,7 +680,7 @@ class ChatMessageModel extends ChatMessage {
 
 //------------------------------------------------------------------------------
 
-// File: data\repositories\chat_repository_impl.dart (1814 bytes)
+// File: lib\data\repositories\chat_repository_impl.dart (1814 bytes)
 import '../../domain/entities/chat_message.dart';
 import '../../domain/enums/connection_status.dart';
 import '../../domain/enums/session_status.dart';
@@ -602,7 +746,7 @@ class ChatRepositoryImpl implements IChatRepository {
 
 //------------------------------------------------------------------------------
 
-// File: domain\entities\chat_message.dart (303 bytes)
+// File: lib\domain\entities\chat_message.dart (303 bytes)
 enum MessageRole { user, assistant }
 
 class ChatMessage {
@@ -622,7 +766,7 @@ class ChatMessage {
 
 //------------------------------------------------------------------------------
 
-// File: domain\entities\voice_option.dart (1051 bytes)
+// File: lib\domain\entities\voice_option.dart (1051 bytes)
 class VoiceOption {
   final String name;
   final String voiceId;
@@ -663,7 +807,7 @@ class VoiceOptions {
 
 //------------------------------------------------------------------------------
 
-// File: domain\enums\connection_status.dart (84 bytes)
+// File: lib\domain\enums\connection_status.dart (84 bytes)
 enum ConnectionStatus {
   disconnected,
   connecting,
@@ -674,7 +818,7 @@ enum ConnectionStatus {
 
 //------------------------------------------------------------------------------
 
-// File: domain\enums\session_status.dart (166 bytes)
+// File: lib\domain\enums\session_status.dart (166 bytes)
 enum SessionStatus {
   idle,
   initializing,
@@ -691,7 +835,7 @@ enum SessionStatus {
 
 //------------------------------------------------------------------------------
 
-// File: domain\repositories\i_chat_repository.dart (771 bytes)
+// File: lib\domain\repositories\i_chat_repository.dart (771 bytes)
 import '../entities/chat_message.dart';
 import '../enums/connection_status.dart';
 import '../enums/session_status.dart';
@@ -719,7 +863,7 @@ abstract class IChatRepository {
 
 //------------------------------------------------------------------------------
 
-// File: domain\usecases\connect_usecase.dart (1466 bytes)
+// File: lib\domain\usecases\connect_usecase.dart (844 bytes)
 import 'package:flutter/foundation.dart';
 
 import '../repositories/i_chat_repository.dart';
@@ -729,7 +873,7 @@ class ConnectUseCase {
 
   ConnectUseCase(this._repository);
 
-  Future<bool> execute(String serverUrl, String systemPrompt) async {
+  Future<bool> execute(String serverUrl) async {
     debugPrint('[ConnectUseCase] step 1 → connect($serverUrl)');
     final connected = await _repository.connect(serverUrl);
     debugPrint('[ConnectUseCase] step 1 result → connected=$connected');
@@ -740,18 +884,7 @@ class ConnectUseCase {
     debugPrint('[ConnectUseCase] step 2 result → initialized=$initialized');
     if (!initialized) return false;
 
-    await Future.delayed(const Duration(milliseconds: 100));
-    debugPrint('[ConnectUseCase] step 3 → sendPromptStart()');
-    await _repository.sendPromptStart();
-
-    await Future.delayed(const Duration(milliseconds: 100));
-    debugPrint('[ConnectUseCase] step 4 → sendSystemPrompt()');
-    await _repository.sendSystemPrompt(systemPrompt);
-
-    // No audioStart here — the greeting uses a text user turn (userText), not audio.
-    // stopAudio will skip endAudioContent (isAudioContentStartSent=false) and just
-    // send promptEnd + sessionEnd, which is correct for a text-only turn.
-    debugPrint('[ConnectUseCase] ✅ session ready for greeting');
+    debugPrint('[ConnectUseCase] ✅ connected and session initialized');
     return true;
   }
 }
@@ -759,7 +892,7 @@ class ConnectUseCase {
 
 //------------------------------------------------------------------------------
 
-// File: domain\usecases\disconnect_usecase.dart (240 bytes)
+// File: lib\domain\usecases\disconnect_usecase.dart (240 bytes)
 import '../repositories/i_chat_repository.dart';
 
 class DisconnectUseCase {
@@ -775,7 +908,7 @@ class DisconnectUseCase {
 
 //------------------------------------------------------------------------------
 
-// File: domain\usecases\send_audio_usecase.dart (2118 bytes)
+// File: lib\domain\usecases\send_audio_usecase.dart (2118 bytes)
 import 'package:flutter/foundation.dart';
 
 import '../repositories/i_chat_repository.dart';
@@ -833,7 +966,7 @@ class SendAudioUseCase {
 
 //------------------------------------------------------------------------------
 
-// File: injection_container.dart (1125 bytes)
+// File: lib\injection_container.dart (1125 bytes)
 import 'package:get_it/get_it.dart';
 
 import 'core/audio/audio_player_service.dart';
@@ -868,7 +1001,7 @@ void initDependencies() {
 
 //------------------------------------------------------------------------------
 
-// File: main.dart (737 bytes)
+// File: lib\main.dart (737 bytes)
 import 'package:flutter/material.dart';
 
 import 'injection_container.dart';
@@ -903,9 +1036,8 @@ class NovaChatApp extends StatelessWidget {
 
 //------------------------------------------------------------------------------
 
-// File: presentation\cubit\chat_cubit.dart (8193 bytes)
+// File: lib\presentation\cubit\chat_cubit.dart (8332 bytes)
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
@@ -933,6 +1065,7 @@ class ChatCubit extends Cubit<ChatState> {
   StreamSubscription? _errorSub;
   StreamSubscription? _recorderSub;
   StreamSubscription? _playbackSub;
+  StreamSubscription? _vadSub; // NEW: VAD silence events
 
   bool _greetingTriggered = false;
   bool _micStarting = false;
@@ -1017,50 +1150,17 @@ class ChatCubit extends Cubit<ChatState> {
 
   Future<void> autoConnect(VoiceOption voice) async {
     debugPrint('[Cubit] autoConnect() voice=${voice.name}');
-    _greetingTriggered = false;
     _systemPrompt = voice.systemPrompt;
-    final result = await _connectUseCase.execute(
-      'http://10.0.2.2:3000',
-      _systemPrompt,
-    );
+    final result = await _connectUseCase.execute('http://10.0.2.2:3000');
     debugPrint('[Cubit] autoConnect() ConnectUseCase returned $result');
     if (result && !isClosed) {
-      await _triggerGreeting();
+      _greetingTriggered = true;
+      _startNextTurn();
     }
   }
 
-  Future<void> _triggerGreeting() async {
-    debugPrint(
-      '[Cubit] _triggerGreeting() → sending user text turn to trigger greeting',
-    );
-    _greetingTriggered = true;
-    // Nova Sonic requires audio content in every prompt.
-    // Open an audio block, send 1 silence chunk (100ms), then a text "Hello" turn.
-    // The backend auto-closes the audio block before the text, giving correct ordering:
-    //   contentEnd(AUDIO) → contentStart(TEXT) → textInput → contentEnd(TEXT) → promptEnd
-    await _repository.sendAudioStart();
-
-    debugPrint('[Cubit] _triggerGreeting() → waiting for audioReady');
-    await _repository.sessionStatusStream
-        .firstWhere((s) => s == SessionStatus.ready)
-        .timeout(
-          const Duration(seconds: 8),
-          onTimeout: () {
-            debugPrint(
-              '[Cubit] _triggerGreeting() ⏱ timed out waiting for audioReady',
-            );
-            return SessionStatus.error;
-          },
-        );
-
-    // One 100ms silence chunk to satisfy "content must have data" requirement.
-    await _repository.sendAudioChunk(base64Encode(Uint8List(3200)));
-    await _repository.sendUserText('Hello');
-    await _repository.sendStopAudio();
-    debugPrint('[Cubit] _triggerGreeting() done — waiting for AI response');
-  }
-
   /// Starts a new prompt within the existing session and begins recording.
+  /// VAD will automatically stop the turn when silence is detected.
   Future<void> _startNextTurn() async {
     debugPrint('[Cubit] _startNextTurn() called  micStarting=$_micStarting');
     if (isClosed || _micStarting) return;
@@ -1092,26 +1192,62 @@ class ChatCubit extends Cubit<ChatState> {
 
       if (isClosed) return;
 
-      debugPrint('[Cubit] _startNextTurn() → subscribing to audioChunkStream');
-      _recorderSub = _recorder.audioChunkStream.listen((base64Chunk) {
-        _sendAudioUseCase.sendChunk(base64Chunk);
+      // Subscribe to VAD silence events BEFORE starting the recorder so we
+      // never miss the event in case the stream fires on the first tick.
+      _vadSub?.cancel();
+      _vadSub = _recorder.silenceDetectedStream.listen((_) {
+        debugPrint('[Cubit] VAD silence detected → auto-stopping turn');
+        // Guard: only act if still recording; ignore stale events.
+        if (!isClosed && state.sessionStatus == SessionStatus.recording) {
+          _stopMic();
+        }
       });
 
+      // Start physical recorder — VAD runs inside the recorder service.
       debugPrint('[Cubit] _startNextTurn() → recorder.startRecording()');
       await _recorder.startRecording();
-      debugPrint('[Cubit] _startNextTurn() ✅ mic is live');
-      if (!isClosed)
+
+      // Subscribe to audio chunks and forward to socket.
+      _recorderSub?.cancel();
+      _recorderSub = _recorder.audioChunkStream.listen(
+        (base64Chunk) {
+          _sendAudioUseCase.sendChunk(base64Chunk).catchError((Object e) {
+            debugPrint('[Cubit] sendChunk error: $e');
+          });
+        },
+        onError: (Object e) => debugPrint('[Cubit] audioChunkStream error: $e'),
+      );
+
+      debugPrint('[Cubit] _startNextTurn() ✅ mic is live — VAD will auto-stop');
+      if (!isClosed) {
         emit(state.copyWith(sessionStatus: SessionStatus.recording));
-    } catch (e) {
-      debugPrint('[Cubit] _startNextTurn() ❌ error: $e');
+      }
+    } catch (e, st) {
+      debugPrint('[Cubit] _startNextTurn() ❌ error: $e\n$st');
     } finally {
       _micStarting = false;
     }
   }
 
+  /// Called by the UI manual stop button (fallback in case VAD misses the
+  /// end of speech — e.g. very quiet environments or background noise).
+  Future<void> stopSpeaking() async {
+    debugPrint('[Cubit] stopSpeaking() called — ending user turn manually');
+    if (_recorderSub == null) {
+      debugPrint('[Cubit] stopSpeaking() — no active recording, ignoring');
+      return;
+    }
+    await _stopMic();
+  }
+
   Future<void> _stopMic() async {
     debugPrint('[Cubit] _stopMic()  recorderSub=${_recorderSub != null}');
     if (_recorderSub == null) return;
+
+    // Cancel VAD subscription first to prevent double-fire.
+    await _vadSub?.cancel();
+    _vadSub = null;
+
     await _recorderSub?.cancel();
     _recorderSub = null;
     await _recorder.stopRecording();
@@ -1129,6 +1265,7 @@ class ChatCubit extends Cubit<ChatState> {
     _errorSub?.cancel();
     _recorderSub?.cancel();
     _playbackSub?.cancel();
+    _vadSub?.cancel();
     await _recorder.stopRecording();
     _recorder.dispose();
     _player.dispose();
@@ -1140,7 +1277,7 @@ class ChatCubit extends Cubit<ChatState> {
 
 //------------------------------------------------------------------------------
 
-// File: presentation\cubit\chat_state.dart (1367 bytes)
+// File: lib\presentation\cubit\chat_state.dart (1367 bytes)
 import 'package:equatable/equatable.dart';
 
 import '../../domain/entities/chat_message.dart';
@@ -1192,7 +1329,7 @@ class ChatState extends Equatable {
 
 //------------------------------------------------------------------------------
 
-// File: presentation\screens\chat_screen.dart (5426 bytes)
+// File: lib\presentation\screens\chat_screen.dart (8859 bytes)
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
@@ -1236,8 +1373,6 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      // Allow back navigation; cubit.close() is called automatically when the
-      // BlocProvider created in HomeScreen is removed from the widget tree.
       canPop: true,
       child: Scaffold(
         appBar: AppBar(
@@ -1254,7 +1389,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 final (icon, color) = switch (state.sessionStatus) {
                   SessionStatus.recording => (Icons.mic, Colors.red),
                   SessionStatus.aiSpeaking => (Icons.volume_up, Colors.blue),
-                  SessionStatus.processing => (Icons.hourglass_top, Colors.orange),
+                  SessionStatus.processing => (
+                    Icons.hourglass_top,
+                    Colors.orange,
+                  ),
                   _ => (Icons.mic_off, Colors.grey),
                 };
                 return Padding(
@@ -1267,7 +1405,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         body: Stack(
           children: [
-            // ── Chat messages ────────────────────────────────────────────
+            // ── Chat messages ──────────────────────────────────────────────
             BlocConsumer<ChatCubit, ChatState>(
               listenWhen: (p, c) => p.messages.length != c.messages.length,
               listener: (_, _) => _scrollToBottom(),
@@ -1278,7 +1416,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 }
                 return ListView.builder(
                   controller: _scrollController,
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 120),
                   itemCount: state.messages.length,
                   itemBuilder: (context, index) =>
                       MessageBubble(message: state.messages[index]),
@@ -1286,7 +1424,7 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
 
-            // ── Loading overlay (shown until first message arrives) ──────
+            // ── Loading overlay ────────────────────────────────────────────
             BlocBuilder<ChatCubit, ChatState>(
               buildWhen: (p, c) =>
                   p.isLoading != c.isLoading ||
@@ -1294,7 +1432,6 @@ class _ChatScreenState extends State<ChatScreen> {
                   p.sessionStatus != c.sessionStatus,
               builder: (context, state) {
                 if (!state.isLoading) return const SizedBox.shrink();
-
                 return Container(
                   color: Theme.of(context).colorScheme.surface,
                   child: Center(
@@ -1312,6 +1449,54 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                       ],
                     ),
+                  ),
+                );
+              },
+            ),
+
+            // ── Recording indicator + manual stop button ───────────────────
+            // VAD handles stop automatically. The button is a fallback for:
+            //   • Noisy environments where silence threshold is never crossed
+            //   • Very quiet speech that VAD doesn't detect
+            //   • Emulator/device microphone quirks
+            BlocBuilder<ChatCubit, ChatState>(
+              buildWhen: (p, c) => p.sessionStatus != c.sessionStatus,
+              builder: (context, state) {
+                if (state.sessionStatus != SessionStatus.recording) {
+                  return const SizedBox.shrink();
+                }
+                return Positioned(
+                  bottom: 24,
+                  left: 24,
+                  right: 24,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // VAD status hint
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: const Text(
+                          '🎙 Listening… will stop automatically when you pause',
+                          style: TextStyle(color: Colors.white, fontSize: 12),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      // Manual fallback button
+                      Center(
+                        child: _StopSpeakingButton(
+                          onPressed: () =>
+                              context.read<ChatCubit>().stopSpeaking(),
+                        ),
+                      ),
+                    ],
                   ),
                 );
               },
@@ -1344,10 +1529,58 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
+class _StopSpeakingButton extends StatefulWidget {
+  final VoidCallback onPressed;
+
+  const _StopSpeakingButton({required this.onPressed});
+
+  @override
+  State<_StopSpeakingButton> createState() => _StopSpeakingButtonState();
+}
+
+class _StopSpeakingButtonState extends State<_StopSpeakingButton>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _pulse,
+      builder: (context, child) =>
+          Transform.scale(scale: 1.0 + _pulse.value * 0.06, child: child),
+      child: FloatingActionButton.extended(
+        onPressed: widget.onPressed,
+        backgroundColor: Colors.red.shade700,
+        foregroundColor: Colors.white,
+        icon: const Icon(Icons.stop_rounded),
+        label: const Text(
+          'Done Speaking',
+          style: TextStyle(fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+}
+
 
 //------------------------------------------------------------------------------
 
-// File: presentation\screens\home_screen.dart (3823 bytes)
+// File: lib\presentation\screens\home_screen.dart (3766 bytes)
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
@@ -1373,10 +1606,7 @@ class HomeScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Nova Chat'),
-        centerTitle: true,
-      ),
+      appBar: AppBar(title: const Text('Nova Chat'), centerTitle: true),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -1385,16 +1615,16 @@ class HomeScreen extends StatelessWidget {
             const SizedBox(height: 16),
             Text(
               'Select a Voice',
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
+              style: Theme.of(
+                context,
+              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 8),
             Text(
               'Choose a voice to start your conversation.',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: Colors.grey[600],
-                  ),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: Colors.grey[600]),
             ),
             const SizedBox(height: 32),
             ...VoiceOptions.all.map(
@@ -1451,15 +1681,15 @@ class _VoiceCard extends StatelessWidget {
                     Text(
                       voice.name,
                       style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                            fontWeight: FontWeight.w600,
-                          ),
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                     const SizedBox(height: 2),
                     Text(
                       'Tap to start conversation',
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: Colors.grey[600],
-                          ),
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
                     ),
                   ],
                 ),
@@ -1476,7 +1706,7 @@ class _VoiceCard extends StatelessWidget {
 
 //------------------------------------------------------------------------------
 
-// File: presentation\widgets\message_bubble.dart (1899 bytes)
+// File: lib\presentation\widgets\message_bubble.dart (1899 bytes)
 import 'package:flutter/material.dart';
 
 import '../../domain/entities/chat_message.dart';
@@ -1538,7 +1768,7 @@ class MessageBubble extends StatelessWidget {
 
 //------------------------------------------------------------------------------
 
-// File: presentation\widgets\recording_indicator.dart (1352 bytes)
+// File: lib\presentation\widgets\recording_indicator.dart (1352 bytes)
 import 'package:flutter/material.dart';
 
 class RecordingIndicator extends StatefulWidget {

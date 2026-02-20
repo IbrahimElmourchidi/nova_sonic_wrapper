@@ -182,6 +182,10 @@ export class SessionUseCase {
 
   // ── Queries ───────────────────────────────────────────────────────────────
 
+  getSession(sessionId: string): SessionData {
+    return this.requireActiveSession(sessionId);
+  }
+
   isSessionActive(sessionId: string): boolean {
     const session = this.sessions.findById(sessionId);
     return !!session?.isActive;
