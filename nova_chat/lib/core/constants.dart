@@ -1,8 +1,8 @@
 class AppConstants {
   AppConstants._();
-  static const String serverUrl = 'http://10.0.2.2:3000';
-  // static const String serverUrl =
-  //     'https://nova-sonic-server-673314104404.europe-west3.run.app';
+  // static const String serverUrl = 'http://10.0.2.2:3000';
+  static const String serverUrl =
+      'https://nova-sonic-server-673314104404.europe-west3.run.app';
 
   static const int inputSampleRate = 16000;
   static const int outputSampleRate = 24000;

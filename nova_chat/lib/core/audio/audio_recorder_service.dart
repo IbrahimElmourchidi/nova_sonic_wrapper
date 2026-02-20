@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:record/record.dart';
@@ -44,6 +43,7 @@ class AudioRecorderService {
   int _silenceCount = 0;
   int _speechCount = 0;
   int _chunkCount = 0;
+  bool _isHardwareActive = false;
 
   // ── Public streams ────────────────────────────────────────────────────────
 
@@ -61,8 +61,17 @@ class AudioRecorderService {
     _resetVad();
     _chunkCount = 0;
 
+    // Hardware is already running (kept alive between turns for AEC).
+    // Just reset VAD so the new turn starts fresh.
+    if (_isHardwareActive) {
+      debugPrint(
+        '[AudioRecorder] startRecording() — hardware already active, VAD reset only',
+      );
+      return;
+    }
+
     try {
-      debugPrint('[AudioRecorder] startRecording()');
+      debugPrint('[AudioRecorder] startRecording() — starting hardware mic');
       debugPrint(
         '[VAD] thresholds: speech>=$_speechThreshold  silence<$_silenceThreshold  '
         'need $_silenceChunksRequired silent chunks after $_minSpeechChunks speech chunks',
@@ -73,11 +82,13 @@ class AudioRecorderService {
           encoder: AudioEncoder.pcm16bits,
           sampleRate: 16000,
           numChannels: 1,
-          autoGain: false,
-          echoCancel: false,
-          noiseSuppress: false,
+          autoGain: true, // ← was false — helps normalize user volume
+          echoCancel: true, // ← was false — KEY: hardware AEC
+          noiseSuppress: true, // ← was false — removes background noise
         ),
       );
+
+      _isHardwareActive = true;
 
       _recordSubscription = stream.listen(
         _onChunk,
@@ -86,6 +97,7 @@ class AudioRecorderService {
         },
         onDone: () {
           debugPrint('[AudioRecorder] stream done  totalChunks=$_chunkCount');
+          _isHardwareActive = false;
         },
         cancelOnError: false,
       );
@@ -98,11 +110,15 @@ class AudioRecorderService {
 
   Future<void> stopRecording() async {
     debugPrint('[AudioRecorder] stopRecording()  totalChunks=$_chunkCount');
+    _isHardwareActive = false;
     await _recordSubscription?.cancel();
     _recordSubscription = null;
     await _recorder.stop();
     _resetVad();
   }
+
+  /// Resets VAD state between turns without touching the hardware mic.
+  void resetVad() => _resetVad();
 
   void dispose() {
     _recordSubscription?.cancel();

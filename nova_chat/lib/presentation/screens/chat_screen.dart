@@ -1,3 +1,5 @@
+import 'package:audio_session/audio_session.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
@@ -23,7 +25,29 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    context.read<ChatCubit>().autoConnect(widget.voice);
+    _configureAudioSession().then((_) {
+      context.read<ChatCubit>().autoConnect(widget.voice);
+    });
+  }
+
+  Future<void> _configureAudioSession() async {
+    final session = await AudioSession.instance;
+    await session.configure(
+      AudioSessionConfiguration(
+        avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+        avAudioSessionCategoryOptions:
+            AVAudioSessionCategoryOptions.defaultToSpeaker |
+            AVAudioSessionCategoryOptions.allowBluetooth,
+        avAudioSessionMode: AVAudioSessionMode.videoChat,
+        androidAudioAttributes: AndroidAudioAttributes(
+          contentType: AndroidAudioContentType.speech,
+          usage: AndroidAudioUsage.voiceCommunication,
+        ),
+        androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
+        androidWillPauseWhenDucked: false,
+      ),
+    );
+    await session.setActive(true);
   }
 
   void _scrollToBottom() {
@@ -157,13 +181,8 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                       ),
                       const SizedBox(height: 12),
+
                       // Manual fallback button
-                      Center(
-                        child: _StopSpeakingButton(
-                          onPressed: () =>
-                              context.read<ChatCubit>().stopSpeaking(),
-                        ),
-                      ),
                     ],
                   ),
                 );
@@ -193,54 +212,8 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void dispose() {
     _scrollController.dispose();
+    AudioSession.instance.then((s) => s.setActive(false));
+
     super.dispose();
-  }
-}
-
-class _StopSpeakingButton extends StatefulWidget {
-  final VoidCallback onPressed;
-
-  const _StopSpeakingButton({required this.onPressed});
-
-  @override
-  State<_StopSpeakingButton> createState() => _StopSpeakingButtonState();
-}
-
-class _StopSpeakingButtonState extends State<_StopSpeakingButton>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _pulse;
-
-  @override
-  void initState() {
-    super.initState();
-    _pulse = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    )..repeat(reverse: true);
-  }
-
-  @override
-  void dispose() {
-    _pulse.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _pulse,
-      builder: (context, child) =>
-          Transform.scale(scale: 1.0 + _pulse.value * 0.06, child: child),
-      child: FloatingActionButton.extended(
-        onPressed: widget.onPressed,
-        backgroundColor: Colors.red.shade700,
-        foregroundColor: Colors.white,
-        icon: const Icon(Icons.stop_rounded),
-        label: const Text(
-          'Done Speaking',
-          style: TextStyle(fontWeight: FontWeight.w600),
-        ),
-      ),
-    );
   }
 }

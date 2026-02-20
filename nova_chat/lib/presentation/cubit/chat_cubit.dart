@@ -70,11 +70,11 @@ class ChatCubit extends Cubit<ChatState> {
       emit(state.copyWith(sessionStatus: status));
 
       if (status == SessionStatus.aiSpeaking) {
-        debugPrint('[Cubit] AI speaking → _stopMic()');
+        debugPrint(
+          '[Cubit] AI speaking → pausing mic send (hardware stays on for AEC)',
+        );
         _player.markStreamActive();
-        // FIX: _stopMic() now only stops the local recorder.
-        // It no longer emits stopAudio, so the server stream stays open.
-        _stopMic();
+        _pauseMicSend(); // ← renamed, see below
       }
 
       if (status == SessionStatus.turnComplete && _greetingTriggered) {
@@ -99,11 +99,11 @@ class ChatCubit extends Cubit<ChatState> {
     });
 
     _playbackSub = _player.playbackCompleteStream.listen((_) {
-      debugPrint('[Cubit] playbackComplete → _startNextTurn()');
+      debugPrint('[Cubit] playbackComplete → resuming mic for next turn');
       if (!isClosed &&
           _greetingTriggered &&
           state.sessionStatus == SessionStatus.waitingForPlayback) {
-        _startNextTurn();
+        _resumeMicSend();
       }
     });
 
@@ -190,10 +190,7 @@ class ChatCubit extends Cubit<ChatState> {
       _vadSub = _recorder.silenceDetectedStream.listen((_) {
         debugPrint('[Cubit] VAD silence detected → auto-stopping mic');
         if (!isClosed && state.sessionStatus == SessionStatus.recording) {
-          // FIX: _stopMic() only stops local recording — it does NOT emit
-          // stopAudio.  The server stream remains open and will respond
-          // based on the audio it received.
-          _stopMic();
+          _pauseMicSend();
         }
       });
 
@@ -231,33 +228,53 @@ class ChatCubit extends Cubit<ChatState> {
     await _stopMic();
   }
 
-  // FIX: _stopMic() now ONLY stops the local recorder.
-  //
-  // Previously it called _sendAudioUseCase.stopRecording() which emitted
-  // stopAudio to the server.  That told the server to tear down the
-  // bidirectional stream, making all subsequent turns impossible.
-  //
-  // The server stream must stay open until the whole conversation ends.
-  // stopAudio is sent only in close() via endSession().
-  //
+  /// Called at session end only — kills the hardware mic.
   Future<void> _stopMic() async {
-    debugPrint('[Cubit] _stopMic()  recorderSub=${_recorderSub != null}');
-    if (_recorderSub == null) return;
-
-    // Cancel VAD first to prevent double-fire.
+    debugPrint('[Cubit] _stopMic() — full hardware stop');
     await _vadSub?.cancel();
     _vadSub = null;
-
     await _recorderSub?.cancel();
     _recorderSub = null;
-
-    // Stop the hardware microphone.
     await _recorder.stopRecording();
+  }
 
-    // FIX: DO NOT call _sendAudioUseCase.stopRecording() / sendStopAudio here.
-    // The server stream stays open.
+  /// Called between turns — stops sending audio to server but keeps hardware on for AEC.
+  Future<void> _pauseMicSend() async {
+    debugPrint('[Cubit] _pauseMicSend() — stop sending, hardware stays on');
+    await _vadSub?.cancel();
+    _vadSub = null;
+    await _recorderSub?.cancel();
+    _recorderSub = null;
+    // DO NOT call _recorder.stopRecording() — hardware mic stays alive
+  }
 
-    debugPrint('[Cubit] _stopMic() done');
+  /// Called after AI playback ends — re-subscribes to mic stream for next turn.
+  Future<void> _resumeMicSend() async {
+    debugPrint('[Cubit] _resumeMicSend() — re-subscribing to mic stream');
+    if (isClosed || _micStarting) return;
+
+    _recorder.resetVad(); // fresh VAD state for new turn
+
+    // Re-attach VAD silence listener
+    _vadSub?.cancel();
+    _vadSub = _recorder.silenceDetectedStream.listen((_) {
+      debugPrint('[Cubit] VAD silence → pausing mic send');
+      if (!isClosed && state.sessionStatus == SessionStatus.recording) {
+        _pauseMicSend();
+      }
+    });
+
+    // Re-attach chunk sender
+    _recorderSub?.cancel();
+    _recorderSub = _recorder.audioChunkStream.listen((base64Chunk) {
+      _sendAudioUseCase.sendChunk(base64Chunk).catchError((Object e) {
+        debugPrint('[Cubit] sendChunk error: $e');
+      });
+    }, onError: (Object e) => debugPrint('[Cubit] audioChunkStream error: $e'));
+
+    if (!isClosed) {
+      emit(state.copyWith(sessionStatus: SessionStatus.recording));
+    }
   }
 
   @override
@@ -273,6 +290,7 @@ class ChatCubit extends Cubit<ChatState> {
     _recorderSub?.cancel();
     _playbackSub?.cancel();
     _vadSub?.cancel();
+    _stopMic();
 
     // Stop local recording.
     await _recorder.stopRecording();

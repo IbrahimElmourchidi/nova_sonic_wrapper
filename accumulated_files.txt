@@ -1,4 +1,4 @@
-// File: application\dots\SessionDtos.ts (2858 bytes)
+// File: src\application\dtos\SessionDtos.ts (2858 bytes)
 // src/application/dtos/SessionDtos.ts
 import { z } from "zod";
 
@@ -77,7 +77,7 @@ export interface HealthCheckResponse {
 
 //------------------------------------------------------------------------------
 
-// File: application\use-cases\AudioStreamUseCase.ts (3070 bytes)
+// File: src\application\use-cases\AudioStreamUseCase.ts (3070 bytes)
 // src/application/use-cases/AudioStreamUseCase.ts
 import "reflect-metadata";
 import { inject, injectable } from "tsyringe";
@@ -191,7 +191,7 @@ export class AudioStreamUseCase {
 
 //------------------------------------------------------------------------------
 
-// File: application\use-cases\SessionUseCase.ts (8290 bytes)
+// File: src\application\use-cases\SessionUseCase.ts (8395 bytes)
 // src/application/use-cases/SessionUseCase.ts
 import "reflect-metadata";
 import { inject, injectable } from "tsyringe";
@@ -376,6 +376,10 @@ export class SessionUseCase {
 
   // ── Queries ───────────────────────────────────────────────────────────────
 
+  getSession(sessionId: string): SessionData {
+    return this.requireActiveSession(sessionId);
+  }
+
   isSessionActive(sessionId: string): boolean {
     const session = this.sessions.findById(sessionId);
     return !!session?.isActive;
@@ -412,7 +416,7 @@ export class SessionUseCase {
 
 //------------------------------------------------------------------------------
 
-// File: domain\entities\Session.ts (1648 bytes)
+// File: src\domain\entities\Session.ts (2193 bytes)
 // src/domain/entities/Session.ts
 import { randomUUID } from "node:crypto";
 import { Subject } from "rxjs";
@@ -450,12 +454,26 @@ export interface SessionData {
   isAudioContentStartSent: boolean;
   lastActivity: number;
   status: SessionStatus;
+  streamReady: Promise<void>;
+  resolveStreamReady: () => void;
+}
+
+/** Resets the streamReady promise for a new Bedrock stream (called between turns). */
+export function resetStreamReady(session: SessionData): void {
+  let resolve!: () => void;
+  session.streamReady = new Promise<void>((r) => { resolve = r; });
+  session.resolveStreamReady = resolve;
 }
 
 export function createSessionData(
   sessionId: SessionId,
   inferenceConfig: InferenceConfig
 ): SessionData {
+  let resolveStreamReady!: () => void;
+  const streamReady = new Promise<void>((resolve) => {
+    resolveStreamReady = resolve;
+  });
+
   return {
     sessionId,
     promptName: randomUUID(),
@@ -474,12 +492,14 @@ export function createSessionData(
     isAudioContentStartSent: false,
     lastActivity: Date.now(),
     status: SessionStatus.INITIALIZING,
+    streamReady,
+    resolveStreamReady,
   };
 }
 
 //------------------------------------------------------------------------------
 
-// File: domain\errors\index.ts (1628 bytes)
+// File: src\domain\errors\index.ts (1628 bytes)
 // src/domain/errors/index.ts
 
 export class DomainError extends Error {
@@ -546,7 +566,7 @@ export class AudioQueueFullError extends DomainError {
 
 //------------------------------------------------------------------------------
 
-// File: domain\repositories\ISessionRepository.ts (991 bytes)
+// File: src\domain\repositories\ISessionRepository.ts (991 bytes)
 // src/domain/repositories/ISessionRepository.ts
 import type { SessionData, SessionId } from "../entities/Session";
 import type { InferenceConfig } from "../types";
@@ -590,7 +610,7 @@ export interface ISessionRepository {
 
 //------------------------------------------------------------------------------
 
-// File: domain\services\IStreamingService.ts (1720 bytes)
+// File: src\domain\services\IStreamingService.ts (1720 bytes)
 
 // src/domain/services/IStreamingService.ts
 import type { SessionId } from "../entities/Session";
@@ -659,7 +679,7 @@ export interface IStreamingService {
 
 //------------------------------------------------------------------------------
 
-// File: domain\services\IToolService.ts (386 bytes)
+// File: src\domain\services\IToolService.ts (386 bytes)
 // src/domain/services/IToolService.ts
 
 export interface IToolService {
@@ -677,7 +697,7 @@ export interface IToolService {
 
 //------------------------------------------------------------------------------
 
-// File: domain\types.ts (1536 bytes)
+// File: src\domain\types.ts (1536 bytes)
 // src/domain/types.ts
 
 export interface InferenceConfig {
@@ -745,7 +765,7 @@ export type EventHandler<T = unknown> = (data: T) => void | Promise<void>;
 
 //------------------------------------------------------------------------------
 
-// File: infrastructure\bedrock\BedrockStreamingService.ts (21325 bytes)
+// File: src\infrastructure\bedrock\BedrockStreamingService.ts (21655 bytes)
 // src/infrastructure/bedrock/BedrockStreamingService.ts
 import "reflect-metadata";
 import { inject, injectable } from "tsyringe";
@@ -829,6 +849,8 @@ export class BedrockStreamingService implements IStreamingService {
       this.logger.info("Stream established, processing responses", {
         sessionId,
       });
+
+      session.resolveStreamReady();
 
       await this.processResponseStream(sessionId, response);
     } catch (err) {
@@ -1132,11 +1154,17 @@ export class BedrockStreamingService implements IStreamingService {
       };
     }
 
+    // Per-iterator flag so that return()/throw() only stop THIS iterator,
+    // not the entire session. Without this, the SDK calling return() on a
+    // finished stream would set session.isActive = false and kill the next
+    // stream's iterator too.
+    let aborted = false;
+
     return {
       [Symbol.asyncIterator]: () => ({
         next: async (): Promise<IteratorResult<InvokeModelWithBidirectionalStreamInput>> => {
           try {
-            if (!session.isActive || !this.sessions.has(sessionId)) {
+            if (aborted || !session.isActive || !this.sessions.has(sessionId)) {
               return { value: undefined as any, done: true };
             }
 
@@ -1152,14 +1180,14 @@ export class BedrockStreamingService implements IStreamingService {
               } catch (err) {
                 const isClose =
                   err instanceof Error && err.message === "Stream closed";
-                if (isClose || !session.isActive) {
+                if (isClose || aborted || !session.isActive) {
                   return { value: undefined as any, done: true };
                 }
                 this.logger.error("Unexpected race error", { sessionId, err });
               }
             }
 
-            if (session.queue.length === 0 || !session.isActive) {
+            if (aborted || session.queue.length === 0 || !session.isActive) {
               return { value: undefined as any, done: true };
             }
 
@@ -1174,18 +1202,18 @@ export class BedrockStreamingService implements IStreamingService {
             };
           } catch (err) {
             this.logger.error("Iterator error", { sessionId, err });
-            session.isActive = false;
+            aborted = true;
             return { value: undefined as any, done: true };
           }
         },
 
         return: async () => {
-          session.isActive = false;
+          aborted = true;
           return { value: undefined as any, done: true };
         },
 
         throw: async (err: unknown) => {
-          session.isActive = false;
+          aborted = true;
           throw err;
         },
       }),
@@ -1425,7 +1453,7 @@ export class BedrockStreamingService implements IStreamingService {
 
 //------------------------------------------------------------------------------
 
-// File: infrastructure\config\AppConfig.ts (3527 bytes)
+// File: src\infrastructure\config\AppConfig.ts (3527 bytes)
 // src/infrastructure/config/AppConfig.ts
 import { z } from "zod";
 
@@ -1539,7 +1567,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
 //------------------------------------------------------------------------------
 
-// File: infrastructure\config\container.ts (2241 bytes)
+// File: src\infrastructure\config\container.ts (2241 bytes)
 // src/infrastructure/config/container.ts
 import "reflect-metadata";
 import { container } from "tsyringe";
@@ -1603,7 +1631,7 @@ export function buildContainer(env: NodeJS.ProcessEnv = process.env) {
 
 //------------------------------------------------------------------------------
 
-// File: infrastructure\config\defaults.ts (1515 bytes)
+// File: src\infrastructure\config\defaults.ts (1515 bytes)
 // src/infrastructure/config/defaults.ts
 import type {
   AudioConfiguration,
@@ -1664,7 +1692,7 @@ export const WeatherToolSchema = JSON.stringify({
 
 //------------------------------------------------------------------------------
 
-// File: infrastructure\config\tokens.ts (529 bytes)
+// File: src\infrastructure\config\tokens.ts (529 bytes)
 // src/infrastructure/config/tokens.ts
 
 export const TOKENS = {
@@ -1687,7 +1715,7 @@ export const TOKENS = {
 
 //------------------------------------------------------------------------------
 
-// File: infrastructure\logging\ILogger.ts (331 bytes)
+// File: src\infrastructure\logging\ILogger.ts (331 bytes)
 // src/infrastructure/logging/ILogger.ts
 
 export interface ILogger {
@@ -1699,7 +1727,7 @@ export interface ILogger {
 
 //------------------------------------------------------------------------------
 
-// File: infrastructure\logging\WinstonLogger.ts (1596 bytes)
+// File: src\infrastructure\logging\WinstonLogger.ts (1596 bytes)
 // src/infrastructure/logging/WinstonLogger.ts
 import "reflect-metadata";
 import { injectable } from "tsyringe";
@@ -1757,7 +1785,7 @@ export class WinstonLogger implements ILogger {
 
 //------------------------------------------------------------------------------
 
-// File: infrastructure\repositories\InMemorySessionRepository.ts (1746 bytes)
+// File: src\infrastructure\repositories\InMemorySessionRepository.ts (1746 bytes)
 // src/infrastructure/repositories/InMemorySessionRepository.ts
 import "reflect-metadata";
 import { injectable } from "tsyringe";
@@ -1817,7 +1845,7 @@ export class InMemorySessionRepository implements ISessionRepository {
 
 //------------------------------------------------------------------------------
 
-// File: infrastructure\tools\ToolService.ts (4170 bytes)
+// File: src\infrastructure\tools\ToolService.ts (4170 bytes)
 // src/infrastructure/tools/ToolService.ts
 import "reflect-metadata";
 import { injectable } from "tsyringe";
@@ -1959,7 +1987,7 @@ export class ToolService implements IToolService {
 
 //------------------------------------------------------------------------------
 
-// File: main.ts (2355 bytes)
+// File: src\main.ts (2355 bytes)
 // src/main.ts
 import "dotenv/config";
 import "reflect-metadata";
@@ -2036,7 +2064,7 @@ bootstrap().catch((err) => {
 
 //------------------------------------------------------------------------------
 
-// File: presentation\http\App.ts (4253 bytes)
+// File: src\presentation\http\App.ts (4253 bytes)
 // src/presentation/http/App.ts
 import "reflect-metadata";
 import { inject, injectable } from "tsyringe";
@@ -2175,7 +2203,7 @@ export class App {
 
 //------------------------------------------------------------------------------
 
-// File: presentation\http\HealthRouter.ts (1227 bytes)
+// File: src\presentation\http\HealthRouter.ts (1227 bytes)
 // src/presentation/http/HealthRouter.ts
 import "reflect-metadata";
 import { inject, injectable } from "tsyringe";
@@ -2184,7 +2212,7 @@ import type { Server as SocketServer } from "socket.io";
 
 import { TOKENS } from "../../infrastructure/config/tokens";
 import { SessionUseCase } from "../../application/use-cases/SessionUseCase";
-import type { HealthCheckResponse } from "../../application/dots/SessionDtos";
+import type { HealthCheckResponse } from "../../application/dtos/SessionDtos";
 
 @injectable()
 export class HealthRouter {
@@ -2220,7 +2248,7 @@ export class HealthRouter {
 
 //------------------------------------------------------------------------------
 
-// File: presentation\websocket\SocketGateway.ts (12986 bytes)
+// File: src\presentation\websocket\SocketGateway.ts (13892 bytes)
 // src/presentation/websocket/SocketGateway.ts
 import "reflect-metadata";
 import { inject, injectable } from "tsyringe";
@@ -2236,8 +2264,9 @@ import {
   InitializeSessionRequestSchema,
   SystemPromptRequestSchema,
   AudioStartSchema,
-} from "../../application/dots/SessionDtos";
+} from "../../application/dtos/SessionDtos";
 import { DomainError } from "../../domain/errors";
+import { resetStreamReady } from "../../domain/entities/Session";
 
 enum SessionState {
   CLOSED = "closed",
@@ -2438,6 +2467,13 @@ export class SocketGateway {
         socket.id,
         parsed.success ? parsed.data : {}
       );
+
+      // Wait for the Bedrock stream to be established before telling the client
+      // to proceed. Without this, fast clients (e.g. Flutter's auto-connect flow)
+      // can send all events before the stream is ready, causing 0 output tokens.
+      const session = this.sessionUseCase.getSession(socket.id);
+      await session.streamReady;
+
       socket.emit("audioReady");
     } catch (err) {
       this.logger.error("audioStart error", { socketId: socket.id, err });
@@ -2569,9 +2605,22 @@ export class SocketGateway {
 
     this.sessionUseCase.registerEventHandler(sessionId, "streamComplete", () => {
       socket.emit("streamComplete");
-      this.logger.info("Turn complete, session stays alive", { socketId: socket.id });
-      // Re-initialize audio queue for the next turn's input
+      this.logger.info("Turn complete, restarting stream for next turn", {
+        socketId: socket.id,
+      });
+
+      // Re-initialize audio queue for the next turn's mic input.
       this.audioStream.initQueue(sessionId);
+
+      // Reset streamReady for the next turn so audioReady waits for the new stream.
+      const session = this.sessionUseCase.getSession(sessionId);
+      resetStreamReady(session);
+
+      // The Bedrock bidirectional stream closes after every promptEnd/response
+      // cycle. Start a new stream that will drain whatever is already in the
+      // queue (or wait for the next signal).
+      this.sessionUseCase.startStream(sessionId);
+
       socket.emit("turnComplete");
     });
   }

@@ -6,7 +6,7 @@ import 'package:audio_session/audio_session.dart';
 import 'package:just_audio/just_audio.dart';
 
 class AudioPlayerService {
-  final AudioPlayer _player = AudioPlayer();
+  final AudioPlayer _player = AudioPlayer(handleInterruptions: false);
   final Queue<Uint8List> _queue = Queue();
   bool _isPlaying = false;
   bool _playbackSessionActive = false;
@@ -38,28 +38,6 @@ class AudioPlayerService {
   }
 
   /// Acquire transient audio focus before playback begins.
-  Future<void> _activatePlaybackSession() async {
-    if (_playbackSessionActive) return;
-    _playbackSessionActive = true;
-
-    final session = await AudioSession.instance;
-    await session.configure(const AudioSessionConfiguration(
-      avAudioSessionCategory: AVAudioSessionCategory.playback,
-      avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.defaultToSpeaker,
-      avAudioSessionMode: AVAudioSessionMode.spokenAudio,
-      avAudioSessionRouteSharingPolicy:
-          AVAudioSessionRouteSharingPolicy.defaultPolicy,
-      avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
-      androidAudioAttributes: AndroidAudioAttributes(
-        contentType: AndroidAudioContentType.speech,
-        flags: AndroidAudioFlags.none,
-        usage: AndroidAudioUsage.media,
-      ),
-      androidAudioFocusGainType: AndroidAudioFocusGainType.gainTransient,
-      androidWillPauseWhenDucked: true,
-    ));
-    await session.setActive(true);
-  }
 
   /// Release audio focus so the recorder can capture mic input.
   Future<void> _deactivatePlaybackSession() async {
@@ -78,8 +56,6 @@ class AudioPlayerService {
   Future<void> _drainQueue() async {
     if (_isPlaying || _queue.isEmpty) return;
     _isPlaying = true;
-
-    await _activatePlaybackSession();
 
     // Collect all available chunks into one buffer
     final allBytes = BytesBuilder();
@@ -144,11 +120,7 @@ class AudioPlayerService {
       sampleRate * channels * bitsPerSample ~/ 8,
       Endian.little,
     );
-    header.setUint16(
-      32,
-      channels * bitsPerSample ~/ 8,
-      Endian.little,
-    );
+    header.setUint16(32, channels * bitsPerSample ~/ 8, Endian.little);
     header.setUint16(34, bitsPerSample, Endian.little);
 
     // data chunk
