@@ -6,6 +6,7 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../core/audio/audio_player_service.dart';
 import '../../core/audio/audio_recorder_service.dart';
+import '../../core/constants.dart';
 import '../../domain/entities/voice_option.dart';
 import '../../domain/enums/session_status.dart';
 import '../../domain/repositories/i_chat_repository.dart';
@@ -120,7 +121,7 @@ class ChatCubit extends Cubit<ChatState> {
   Future<void> autoConnect(VoiceOption voice) async {
     debugPrint('[Cubit] autoConnect() voice=${voice.name}');
     _systemPrompt = voice.systemPrompt;
-    final result = await _connectUseCase.execute('http://10.0.2.2:3000');
+    final result = await _connectUseCase.execute(AppConstants.serverUrl);
     debugPrint('[Cubit] autoConnect() ConnectUseCase returned $result');
     if (result && !isClosed) {
       _greetingTriggered = true;
