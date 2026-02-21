@@ -8,7 +8,9 @@
     "start": "node dist/main.js",
     "dev": "ts-node-dev --respawn --transpile-only -r tsconfig-paths/register src/main.ts",
     "lint": "eslint src/**/*.ts",
-    "test": "jest"
+    "test": "jest",
+    "connectAWS": "ssh -i nova_wrapper_key.pem ec2-user@13.61.2.209",
+    "showLogs": "pm2 logs nova-sonic --lines 100"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.600.0",
