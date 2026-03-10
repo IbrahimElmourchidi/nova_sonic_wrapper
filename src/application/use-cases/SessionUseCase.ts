@@ -149,7 +149,7 @@ export class SessionUseCase {
    */
   preEnqueueAutoGreeting(
     sessionId: string,
-    greetingText = "hi",
+    greetingText = "hi, lets start learning",
     systemPrompt?: SystemPromptRequest
   ): void {
     const session = this.requireActiveSession(sessionId);
@@ -166,14 +166,19 @@ export class SessionUseCase {
     this.streaming.enqueuePromptStart(sessionId);
     this.setupSystemPrompt(sessionId, systemPrompt);
 
-    // Nova Sonic requires at least one AUDIO content block per prompt — a
-    // text-only prompt is rejected with "must have at least one audio content".
-    // We satisfy this by sending a short block of raw LPCM silence (300 ms).
-    // This is preferable to a real audio file because:
-    //   • No file I/O or format conversion needed at startup
-    //   • Zero bytes = guaranteed silence, no accidental noise
-    //   • Silence + the system prompt is enough for Nova to generate a greeting
+    // Nova Sonic's protocol requires every prompt to have at least one AUDIO
+    // content block — a text-only prompt is rejected. However, silence alone
+    // is not enough to make Nova speak: it hears nothing and stays quiet.
+    //
+    // The correct combination is:
+    //   1. AUDIO block (silence)  — satisfies the protocol schema requirement
+    //   2. TEXT block (greeting)  — the actual semantic trigger for Nova to
+    //                               generate a spoken response
+    //
+    // Nova processes both blocks together and responds to the text prompt
+    // while the audio block fulfils the protocol constraint.
     this.streaming.enqueueGreetingSilence(sessionId);
+    this.streaming.enqueueUserText(sessionId, greetingText);
 
     // promptEnd tells Nova to start generating. enqueuePromptEnd is declared
     // async only because of a post-enqueue delay; the actual push is sync.
@@ -181,6 +186,7 @@ export class SessionUseCase {
 
     this.logger.info("Auto-greeting pre-enqueued (stream not started yet)", {
       sessionId,
+      greetingText,
     });
   }
 
