@@ -109,6 +109,13 @@ export class BedrockStreamingService implements IStreamingService {
 
   enqueueSessionStart(sessionId: string): void {
     const session = this.requireSession(sessionId);
+
+    // Guard: Nova Sonic rejects duplicate sessionStart events on the same stream.
+    if (session.isSessionStartSent) {
+      this.logger.debug("enqueueSessionStart skipped — already sent", { sessionId });
+      return;
+    }
+
     this.enqueue(sessionId, {
       event: {
         sessionStart: { inferenceConfiguration: session.inferenceConfig },

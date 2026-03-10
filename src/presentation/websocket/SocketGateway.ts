@@ -136,19 +136,16 @@ export class SocketGateway {
       callback?.({ success: true });
 
       // ── Auto-greeting (fire-and-forget) ──────────────────────────────────
-      // Enqueue the greeting only after the HTTP/2 stream is actually open.
-      // Any error here is non-fatal — the client is already connected.
+      // Wait for the HTTP/2 stream to be open, then send the greeting.
+      // sendAutoGreeting guards every step with isXxxSent flags, so it is safe
+      // even if the client has already sent promptStart by this point.
       session.streamReady
         .then(() => {
-          if (this.sessionUseCase.isSessionActive(session.sessionId)) {
-            this.sessionUseCase.sendAutoGreeting(session.sessionId);
-          }
+          if (!this.sessionUseCase.isSessionActive(session.sessionId)) return;
+          return this.sessionUseCase.sendAutoGreeting(session.sessionId);
         })
         .catch((err) => {
-          this.logger.error("Auto-greeting failed: stream never became ready", {
-            socketId: socket.id,
-            err,
-          });
+          this.logger.error("Auto-greeting failed", { socketId: socket.id, err });
         });
       // ─────────────────────────────────────────────────────────────────────
     } catch (err) {
@@ -194,9 +191,8 @@ export class SocketGateway {
       // ── Auto-greeting (fire-and-forget) ──────────────────────────────────
       session.streamReady
         .then(() => {
-          if (this.sessionUseCase.isSessionActive(session.sessionId)) {
-            this.sessionUseCase.sendAutoGreeting(session.sessionId);
-          }
+          if (!this.sessionUseCase.isSessionActive(session.sessionId)) return;
+          return this.sessionUseCase.sendAutoGreeting(session.sessionId);
         })
         .catch((err) => {
           this.logger.error("Auto-greeting failed after startNewChat", {

@@ -130,26 +130,39 @@ export class SessionUseCase {
   // ── Auto-greeting ─────────────────────────────────────────────────────────
 
   /**
-   * Fires the full session-start → prompt-start → system-prompt → user "hi"
-   * sequence so Nova Sonic produces an opening response without any user input.
+   * Fires the greeting sequence so Nova produces an opening response without
+   * waiting for user audio.
    *
-   * Must be called AFTER session.streamReady has resolved (i.e. the Bedrock
-   * bidirectional stream is open and accepting events).
+   * Each step is guarded by the corresponding isXxxSent flag so the method is
+   * safe even if the client already sent some events (e.g. promptStart arrived
+   * before streamReady resolved — a common race on fast clients).
    *
-   * @param greetingText  Override the trigger phrase (default: "hi")
-   * @param systemPrompt  Override the system prompt for this session
+   * Ends with promptEnd so Nova knows to start generating a response.
    */
-  sendAutoGreeting(
+  async sendAutoGreeting(
     sessionId: string,
     greetingText = "hi",
     systemPrompt?: SystemPromptRequest
-  ): void {
-    this.requireActiveSession(sessionId);
+  ): Promise<void> {
+    const session = this.requireActiveSession(sessionId);
 
-    this.streaming.enqueueSessionStart(sessionId);
-    this.streaming.enqueuePromptStart(sessionId);
-    this.setupSystemPrompt(sessionId, systemPrompt);
+    // Only send what the client has not already sent.
+    if (!session.isSessionStartSent) {
+      this.streaming.enqueueSessionStart(sessionId);
+    }
+
+    if (!session.isPromptStartSent) {
+      this.streaming.enqueuePromptStart(sessionId);
+      // System prompt belongs inside this prompt block.
+      this.setupSystemPrompt(sessionId, systemPrompt);
+    }
+
+    // The user text is the actual trigger for Nova to generate a greeting.
     this.streaming.enqueueUserText(sessionId, greetingText);
+
+    // promptEnd signals Nova to start generating. enqueuePromptEnd checks
+    // isPromptStartSent internally so it is always safe to call.
+    await this.streaming.enqueuePromptEnd(sessionId);
 
     this.logger.info("Auto-greeting enqueued", { sessionId, greetingText });
   }
