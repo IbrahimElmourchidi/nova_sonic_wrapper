@@ -15,7 +15,7 @@
     "stopBackend": "pm2 stop nova-wrapper",
     "deleteBackend": "pm2 delete nova-wrapper",
     "deleteAllBackend": "pm2 delete all",
-    "showLogs": "pm2 logs nova-sonic --lines 100"
+    "showLogs": "pm2 logs nova-wrapper --lines 100"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.600.0",
