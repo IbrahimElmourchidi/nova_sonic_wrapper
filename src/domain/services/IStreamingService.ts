@@ -1,4 +1,3 @@
-
 // src/domain/services/IStreamingService.ts
 import type { SessionId } from "../entities/Session";
 import type { AudioConfiguration, TextConfiguration } from "../types";
@@ -38,8 +37,7 @@ export interface IStreamingService {
   ): void;
 
   /**
-   * Enqueue a user text turn (role: USER, type: TEXT) to prompt the model
-   * to respond — used to trigger an AI greeting without requiring audio input.
+   * Enqueue a user text turn (role: USER, type: TEXT).
    */
   enqueueUserText(sessionId: SessionId, content: string): void;
 
@@ -47,6 +45,18 @@ export interface IStreamingService {
    * Enqueue a raw audio chunk.
    */
   enqueueAudioChunk(sessionId: SessionId, audioData: Buffer): void;
+
+  /**
+   * Enqueue a complete silent audio block to satisfy Nova Sonic's requirement
+   * that every prompt contains at least one audio content block.
+   *
+   * Emits: contentStart(AUDIO) → audioInput(silence) → contentEnd(AUDIO)
+   *
+   * Used exclusively by the auto-greeting sequence where no real microphone
+   * input exists yet.  The silence duration is controlled by
+   * GREETING_SILENCE_MS (default 300 ms).
+   */
+  enqueueGreetingSilence(sessionId: SessionId): void;
 
   /**
    * Enqueue the content end event for audio.

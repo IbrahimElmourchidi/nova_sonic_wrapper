@@ -26,6 +26,7 @@ import {
   DefaultAudioOutputConfiguration,
   DefaultToolSchema,
   WeatherToolSchema,
+  DefaultAudioInputConfiguration,
 } from "../config/defaults";
 
 @injectable()
@@ -57,6 +58,62 @@ export class BedrockStreamingService implements IStreamingService {
     this.bedrockClient = new BedrockRuntimeClient({
       region: config.aws.region,
       requestHandler: handler,
+    });
+  }
+
+  enqueueGreetingSilence(sessionId: string): void {
+    const session = this.requireSession(sessionId);
+
+    // Use a dedicated content ID so it never collides with the live mic block.
+    // randomUUID is already imported at the top of BedrockStreamingService
+    const greetingContentId = randomUUID();
+
+    const SILENCE_MS = 300;
+    const SAMPLE_RATE = 16_000;   // Hz  — must match DefaultAudioInputConfiguration
+    const BYTES_PER_SAMPLE = 2;        // 16-bit
+    const CHANNELS = 1;        // mono
+    const silenceBytes = Math.ceil(SILENCE_MS / 1000 * SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS);
+    const silenceBase64 = Buffer.alloc(silenceBytes, 0).toString("base64");
+
+    // 1. Open the audio content block (non-interactive — one-shot input)
+    this.enqueue(sessionId, {
+      event: {
+        contentStart: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+          type: "AUDIO",
+          interactive: false,
+          role: "USER",
+          audioInputConfiguration: DefaultAudioInputConfiguration,
+        },
+      },
+    });
+
+    // 2. Send the silence payload
+    this.enqueue(sessionId, {
+      event: {
+        audioInput: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+          content: silenceBase64,
+        },
+      },
+    });
+
+    // 3. Close the audio content block
+    this.enqueue(sessionId, {
+      event: {
+        contentEnd: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+        },
+      },
+    });
+
+    this.logger.debug("Greeting silence enqueued", {
+      sessionId,
+      silenceMs: SILENCE_MS,
+      silenceBytes,
     });
   }
 
@@ -469,7 +526,7 @@ export class BedrockStreamingService implements IStreamingService {
     sessionId: string,
     response: Awaited<
       ReturnType<BedrockRuntimeClient["send"]>
-    > & { body: AsyncIterable<any> }
+    > & { body: AsyncIterable<any>; }
   ): Promise<void> {
     const session = this.sessions.findById(sessionId);
     if (!session) return;

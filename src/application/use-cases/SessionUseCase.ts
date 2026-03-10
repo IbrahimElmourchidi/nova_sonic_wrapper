@@ -166,18 +166,21 @@ export class SessionUseCase {
     this.streaming.enqueuePromptStart(sessionId);
     this.setupSystemPrompt(sessionId, systemPrompt);
 
-    // enqueueUserText: contentStart(TEXT) + textInput + contentEnd — all sync.
-    // No audio block is open at this point so the method is always safe.
-    this.streaming.enqueueUserText(sessionId, greetingText);
+    // Nova Sonic requires at least one AUDIO content block per prompt — a
+    // text-only prompt is rejected with "must have at least one audio content".
+    // We satisfy this by sending a short block of raw LPCM silence (300 ms).
+    // This is preferable to a real audio file because:
+    //   • No file I/O or format conversion needed at startup
+    //   • Zero bytes = guaranteed silence, no accidental noise
+    //   • Silence + the system prompt is enough for Nova to generate a greeting
+    this.streaming.enqueueGreetingSilence(sessionId);
 
     // promptEnd tells Nova to start generating. enqueuePromptEnd is declared
-    // async only because of a post-enqueue delay used during live turns; the
-    // actual queue push is synchronous so we call it without awaiting the delay.
+    // async only because of a post-enqueue delay; the actual push is sync.
     void this.streaming.enqueuePromptEnd(sessionId);
 
     this.logger.info("Auto-greeting pre-enqueued (stream not started yet)", {
       sessionId,
-      greetingText,
     });
   }
 
