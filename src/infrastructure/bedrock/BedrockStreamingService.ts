@@ -358,7 +358,6 @@ export class BedrockStreamingService implements IStreamingService {
    *   contentStart (AUDIO, interactive:false, role:USER)
    *   → audioInput (100ms silence)
    *   → contentEnd (AUDIO)
-   *   → [200ms delay]
    *   → contentStart (TEXT, interactive:true, role:USER)   ← triggers response
    *   → textInput ("Hello!")
    *   → contentEnd (TEXT)
@@ -422,9 +421,6 @@ export class BedrockStreamingService implements IStreamingService {
       sessionId,
       silentBytes: SILENT_CHUNK_BYTES,
     });
-
-    // Brief delay to let Nova Sonic process the audio block before text arrives
-    await this.delay(200);
 
     // ── Step 2: Interactive TEXT turn (bypasses VAD, guarantees response) ────
     this.enqueueGreetingTrigger(sessionId, "Hello! Please greet the user warmly.");
