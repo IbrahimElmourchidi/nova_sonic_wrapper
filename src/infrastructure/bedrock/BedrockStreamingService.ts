@@ -68,22 +68,22 @@ export class BedrockStreamingService implements IStreamingService {
     // randomUUID is already imported at the top of BedrockStreamingService
     const greetingContentId = randomUUID();
 
-    const SILENCE_MS = 300;
-    const SAMPLE_RATE = 16_000;   // Hz  — must match DefaultAudioInputConfiguration
-    const BYTES_PER_SAMPLE = 2;        // 16-bit
-    const CHANNELS = 1;        // mono
-    const silenceBytes = Math.ceil(SILENCE_MS / 1000 * SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS);
-    const silenceBase64 = Buffer.alloc(silenceBytes, 0).toString("base64");
+    const SILENCE_MS        = 1000;  // 1 s — long enough to reliably trigger Nova's VAD response
+    const SAMPLE_RATE       = 16_000;   // Hz  — must match DefaultAudioInputConfiguration
+    const BYTES_PER_SAMPLE  = 2;        // 16-bit
+    const CHANNELS          = 1;        // mono
+    const silenceBytes      = Math.ceil(SILENCE_MS / 1000 * SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS);
+    const silenceBase64     = Buffer.alloc(silenceBytes, 0).toString("base64");
 
     // 1. Open the audio content block (non-interactive — one-shot input)
     this.enqueue(sessionId, {
       event: {
         contentStart: {
-          promptName: session.promptName,
-          contentName: greetingContentId,
-          type: "AUDIO",
-          interactive: false,
-          role: "USER",
+          promptName:             session.promptName,
+          contentName:            greetingContentId,
+          type:                   "AUDIO",
+          interactive:            true,   // Must be true — tells Nova to respond to this turn
+          role:                   "USER",
           audioInputConfiguration: DefaultAudioInputConfiguration,
         },
       },
@@ -93,9 +93,9 @@ export class BedrockStreamingService implements IStreamingService {
     this.enqueue(sessionId, {
       event: {
         audioInput: {
-          promptName: session.promptName,
+          promptName:  session.promptName,
           contentName: greetingContentId,
-          content: silenceBase64,
+          content:     silenceBase64,
         },
       },
     });
@@ -104,7 +104,7 @@ export class BedrockStreamingService implements IStreamingService {
     this.enqueue(sessionId, {
       event: {
         contentEnd: {
-          promptName: session.promptName,
+          promptName:  session.promptName,
           contentName: greetingContentId,
         },
       },
@@ -112,10 +112,13 @@ export class BedrockStreamingService implements IStreamingService {
 
     this.logger.debug("Greeting silence enqueued", {
       sessionId,
-      silenceMs: SILENCE_MS,
+      silenceMs:    SILENCE_MS,
       silenceBytes,
     });
   }
+
+
+
 
   // ── IStreamingService implementation ────────────────────────────────────
 
