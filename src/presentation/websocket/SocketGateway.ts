@@ -196,6 +196,8 @@ export class SocketGateway {
     }
   }
 
+  
+
   private async handlePromptStart(socket: Socket): Promise<void> {
     try {
       this.requireState(socket.id, [SessionState.ACTIVE, SessionState.READY]);
