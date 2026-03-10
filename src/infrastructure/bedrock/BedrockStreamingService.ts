@@ -337,29 +337,14 @@ export class BedrockStreamingService implements IStreamingService {
    * reliably trigger Nova Sonic's VAD. The model counted input speech tokens
    * but produced 0 output tokens — no audioOutput events, no response.
    *
-   * ROOT CAUSE:
-   * Pre-recorded audio delivered over HTTP/2 does not fire Nova Sonic's VAD
-   * the same way live microphone audio does. Even with an interactive TEXT
-   * turn appended, having a long AUDIO block in the same prompt appeared to
-   * make Nova Sonic apply speech-model output logic (VAD-dependent) rather
-   * than the text-model forced-response logic.
-   *
-   * FIX:
-   * 1. Send a MINIMAL silent audio chunk (100ms of zeros = 3200 bytes).
-   *    This satisfies the "must include audio" API constraint without
-   *    confusing the VAD / output decision engine.
-   * 2. The interactive TEXT turn ("Hello!") is the sole response trigger.
-   *    With only minimal silent audio, Nova Sonic treats the TEXT turn as
-   *    the primary input and always generates a spoken response.
-   * 3. A small delay (200ms) between audio close and text open gives
-   *    Nova Sonic time to process the audio block before the text arrives.
+   * FIX (v3): Send ONLY an interactive TEXT trigger — no audio block at all.
+   * The silent audio block with interactive:false was causing Nova Sonic to
+   * treat the entire turn as "silent user" and suppress output, even though
+   * the TEXT block had interactive:true.
    *
    * Event sequence:
-   *   contentStart (AUDIO, interactive:false, role:USER)
-   *   → audioInput (100ms silence)
-   *   → contentEnd (AUDIO)
    *   → contentStart (TEXT, interactive:true, role:USER)   ← triggers response
-   *   → textInput ("Hello!")
+   *   → textInput ("Hello! Please greet the user warmly.")
    *   → contentEnd (TEXT)
    *   → promptEnd
    *
@@ -368,66 +353,11 @@ export class BedrockStreamingService implements IStreamingService {
   async enqueueAudioGreeting(sessionId: string, _audioData: Buffer): Promise<void> {
     const session = this.requireSession(sessionId);
 
-    // ── Step 1: Minimal silent AUDIO content ────────────────────────────────
-    // 100ms of silence at 16 kHz, 16-bit mono = 3200 bytes of zeros.
-    // This is the smallest chunk that satisfies the API's "must include audio"
-    // constraint without producing enough speech energy to confuse the VAD.
-    const SILENT_CHUNK_BYTES = 3200;
-    const SILENT_CHUNK = Buffer.alloc(SILENT_CHUNK_BYTES); // all zeros = silence
-
-    const greetingContentId = randomUUID();
-
-    this.enqueue(sessionId, {
-      event: {
-        contentStart: {
-          promptName: session.promptName,
-          contentName: greetingContentId,
-          type: "AUDIO",
-          interactive: false,   // NOT interactive — just a placeholder to satisfy API
-          role: "USER",
-          audioInputConfiguration: {
-            audioType: "SPEECH",
-            encoding: "base64",
-            mediaType: "audio/lpcm",
-            sampleRateHertz: 16000,
-            sampleSizeBits: 16,
-            channelCount: 1,
-          },
-        },
-      },
-    });
-
-    this.enqueue(sessionId, {
-      event: {
-        audioInput: {
-          promptName: session.promptName,
-          contentName: greetingContentId,
-          content: SILENT_CHUNK.toString("base64"),
-        },
-      },
-    });
-
-    // Close the audio content block
-    this.enqueue(sessionId, {
-      event: {
-        contentEnd: {
-          promptName: session.promptName,
-          contentName: greetingContentId,
-        },
-      },
-    });
-
-    this.logger.debug("Greeting silent audio enqueued (100ms silence)", {
-      sessionId,
-      silentBytes: SILENT_CHUNK_BYTES,
-    });
-
-    // ── Step 2: Interactive TEXT turn (bypasses VAD, guarantees response) ────
+    // Interactive TEXT trigger only — no silent audio block.
     this.enqueueGreetingTrigger(sessionId, "Hello! Please greet the user warmly.");
 
-    this.logger.debug("Greeting text trigger appended after silent audio", { sessionId });
+    this.logger.debug("Greeting text trigger enqueued (no audio block)", { sessionId });
 
-    // ── Step 3: promptEnd — close the user turn ────────────────────────────
     this.enqueue(sessionId, {
       event: { promptEnd: { promptName: session.promptName } },
     });
@@ -556,10 +486,15 @@ export class BedrockStreamingService implements IStreamingService {
         > => {
           try {
             if (aborted || !session.isActive || !this.sessions.has(sessionId)) {
+              this.logger.debug("[DEBUG] Iterable returning done:true", {
+                sessionId,
+                reason: aborted ? "aborted" : !session.isActive ? "session_inactive" : "session_not_found",
+              });
               return { value: undefined as any, done: true };
             }
 
             if (session.queue.length === 0) {
+              this.logger.debug("[DEBUG] Iterable waiting — queue empty", { sessionId });
               try {
                 await Promise.race([
                   firstValueFrom(session.queueSignal.pipe(take(1))),
@@ -567,10 +502,15 @@ export class BedrockStreamingService implements IStreamingService {
                     throw new Error("Stream closed");
                   }),
                 ]);
+                this.logger.debug("[DEBUG] Iterable woke up — queue signalled", { sessionId, queueLength: session.queue.length });
               } catch (err) {
                 const isClose =
                   err instanceof Error && err.message === "Stream closed";
                 if (isClose || aborted || !session.isActive) {
+                  this.logger.debug("[DEBUG] Iterable returning done:true", {
+                    sessionId,
+                    reason: isClose ? "closeSignal" : aborted ? "aborted" : "session_inactive",
+                  });
                   return { value: undefined as any, done: true };
                 }
                 this.logger.error("Unexpected race error", { sessionId, err });
@@ -578,6 +518,10 @@ export class BedrockStreamingService implements IStreamingService {
             }
 
             if (aborted || session.queue.length === 0 || !session.isActive) {
+              this.logger.debug("[DEBUG] Iterable returning done:true", {
+                sessionId,
+                reason: aborted ? "aborted" : session.queue.length === 0 ? "queue_still_empty" : "session_inactive",
+              });
               return { value: undefined as any, done: true };
             }
 
@@ -713,6 +657,12 @@ export class BedrockStreamingService implements IStreamingService {
       }
 
       // ── FIX: Enhanced end-of-stream diagnostics ───────────────────────────
+      this.logger.info("[DEBUG] for-await loop exited", {
+        sessionId,
+        reason: session.isActive ? "bedrock_closed_stream" : "session_inactive",
+        totalChunks: chunkCount,
+      });
+
       session.receivedAudioOutput = audioOutputCount > 0;
       session.receivedTextOutput = textOutputCount > 0;
 
