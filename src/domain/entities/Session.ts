@@ -37,13 +37,23 @@ export interface SessionData {
   status: SessionStatus;
   streamReady: Promise<void>;
   resolveStreamReady: () => void;
+  /** Rejects streamReady — called by the streaming service on fatal stream error. */
+  rejectStreamReady: (err: unknown) => void;
 }
 
-/** Resets the streamReady promise for a new Bedrock stream (called between turns). */
+/**
+ * Resets the streamReady promise for a new Bedrock stream (called between turns).
+ * The new promise is both resolvable and rejectable so callers never hang.
+ */
 export function resetStreamReady(session: SessionData): void {
   let resolve!: () => void;
-  session.streamReady = new Promise<void>((r) => { resolve = r; });
+  let reject!: (err: unknown) => void;
+  session.streamReady = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
   session.resolveStreamReady = resolve;
+  session.rejectStreamReady = reject;
 }
 
 export function createSessionData(
@@ -51,8 +61,10 @@ export function createSessionData(
   inferenceConfig: InferenceConfig
 ): SessionData {
   let resolveStreamReady!: () => void;
-  const streamReady = new Promise<void>((resolve) => {
+  let rejectStreamReady!: (err: unknown) => void;
+  const streamReady = new Promise<void>((resolve, reject) => {
     resolveStreamReady = resolve;
+    rejectStreamReady = reject;
   });
 
   return {
@@ -75,5 +87,6 @@ export function createSessionData(
     status: SessionStatus.INITIALIZING,
     streamReady,
     resolveStreamReady,
+    rejectStreamReady,
   };
 }

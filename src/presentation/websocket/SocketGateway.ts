@@ -128,16 +128,29 @@ export class SocketGateway {
       // Fire bidirectional stream – do NOT await
       this.sessionUseCase.startStream(session.sessionId);
 
-      // ── Auto-greeting ────────────────────────────────────────────────────
-      // Wait until the Bedrock stream is actually open before enqueuing events.
-      // Without this, events sent before the stream handshake completes are
-      // silently dropped and Nova never produces an opening response.
-      await session.streamReady;
-      this.sessionUseCase.sendAutoGreeting(session.sessionId);
-      // ─────────────────────────────────────────────────────────────────────
-
+      // Respond to the client immediately — do NOT await streamReady here.
+      // Awaiting it blocks the Socket.IO callback which the client uses to
+      // detect a successful connection; if the Bedrock handshake is slow (or
+      // fails before resolveStreamReady is called) the client times out.
       ctx.state = SessionState.ACTIVE;
       callback?.({ success: true });
+
+      // ── Auto-greeting (fire-and-forget) ──────────────────────────────────
+      // Enqueue the greeting only after the HTTP/2 stream is actually open.
+      // Any error here is non-fatal — the client is already connected.
+      session.streamReady
+        .then(() => {
+          if (this.sessionUseCase.isSessionActive(session.sessionId)) {
+            this.sessionUseCase.sendAutoGreeting(session.sessionId);
+          }
+        })
+        .catch((err) => {
+          this.logger.error("Auto-greeting failed: stream never became ready", {
+            socketId: socket.id,
+            err,
+          });
+        });
+      // ─────────────────────────────────────────────────────────────────────
     } catch (err) {
       ctx.state = SessionState.CLOSED;
       this.logger.error("Failed to initialize session", {
@@ -176,13 +189,22 @@ export class SocketGateway {
       this.audioStream.initQueue(session.sessionId);
       this.setupSessionEventHandlers(session.sessionId, socket);
       this.sessionUseCase.startStream(session.sessionId);
-
-      // ── Auto-greeting (same pattern as handleInitialize) ─────────────────
-      await session.streamReady;
-      this.sessionUseCase.sendAutoGreeting(session.sessionId);
-      // ─────────────────────────────────────────────────────────────────────
-
       ctx.state = SessionState.ACTIVE;
+
+      // ── Auto-greeting (fire-and-forget) ──────────────────────────────────
+      session.streamReady
+        .then(() => {
+          if (this.sessionUseCase.isSessionActive(session.sessionId)) {
+            this.sessionUseCase.sendAutoGreeting(session.sessionId);
+          }
+        })
+        .catch((err) => {
+          this.logger.error("Auto-greeting failed after startNewChat", {
+            socketId: socket.id,
+            err,
+          });
+        });
+      // ─────────────────────────────────────────────────────────────────────
     } catch (err) {
       ctx.state = SessionState.CLOSED;
       this.logger.error("Failed to start new chat", {
@@ -195,8 +217,6 @@ export class SocketGateway {
       });
     }
   }
-
-  
 
   private async handlePromptStart(socket: Socket): Promise<void> {
     try {

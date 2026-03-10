@@ -71,7 +71,7 @@ export class BedrockStreamingService implements IStreamingService {
 
       const asyncIterable = this.buildAsyncIterable(sessionId);
 
-      const response:any = await this.bedrockClient.send(
+      const response: any = await this.bedrockClient.send(
         new InvokeModelWithBidirectionalStreamCommand({
           modelId: this.config.bedrock.modelId,
           body: asyncIterable,
@@ -82,11 +82,17 @@ export class BedrockStreamingService implements IStreamingService {
         sessionId,
       });
 
+      // Unblock any code awaiting session.streamReady (e.g. auto-greeting).
       session.resolveStreamReady();
 
       await this.processResponseStream(sessionId, response);
     } catch (err) {
       this.logger.error("Stream error", { sessionId, err });
+
+      // Unblock streamReady waiters so they don't hang indefinitely.
+      // rejectStreamReady is a no-op if the promise was already resolved.
+      session.rejectStreamReady(err);
+
       this.dispatchEvent(sessionId, "error", {
         source: "bidirectionalStream",
         error: err,
