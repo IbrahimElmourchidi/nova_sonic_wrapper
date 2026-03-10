@@ -164,9 +164,9 @@ export class SessionUseCase {
   /**
    * Sends the greeting into the LIVE bidirectional stream after streamReady.
    *
-   * Sends BOTH audio (satisfies Nova Sonic's "must include audio" API
-   * constraint) AND an interactive TEXT turn (bypasses VAD to guarantee a
-   * spoken response). See BedrockStreamingService.enqueueAudioGreeting().
+   * Sends a minimal silent audio chunk (satisfies Nova Sonic's "must include
+   * audio" API constraint) AND an interactive TEXT turn (bypasses VAD to
+   * guarantee a spoken response).
    *
    * MUST be awaited. MUST be called after session.streamReady has resolved.
    */

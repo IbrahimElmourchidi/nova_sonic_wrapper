@@ -60,12 +60,12 @@ export interface IStreamingService {
   enqueueGreetingTrigger(sessionId: SessionId, triggerText?: string): void;
 
   /**
-   * Streams the pre-recorded LPCM greeting audio into the LIVE bidirectional
-   * stream at real microphone cadence, then appends an interactive TEXT turn
-   * in the same prompt to guarantee Nova Sonic generates a spoken response.
+   * Sends a minimal silent audio chunk (to satisfy the Nova Sonic "must include
+   * audio" API requirement) followed by an interactive TEXT turn that bypasses
+   * VAD and guarantees a spoken response.
    *
-   * Sends both audio (API constraint) and text (response trigger):
-   *   contentStart (AUDIO) → audioInput×N → contentEnd (AUDIO)
+   * Event sequence:
+   *   contentStart (AUDIO, interactive:false) → audioInput (silent) → contentEnd (AUDIO)
    *   → contentStart (TEXT, interactive:true) → textInput → contentEnd (TEXT)
    *   → promptEnd
    *
