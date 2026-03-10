@@ -133,11 +133,12 @@ export class SessionUseCase {
    * Fires the greeting sequence so Nova produces an opening response without
    * waiting for user audio.
    *
-   * Each step is guarded by the corresponding isXxxSent flag so the method is
-   * safe even if the client already sent some events (e.g. promptStart arrived
-   * before streamReady resolved — a common race on fast clients).
+   * If the client has already sent promptStart (or opened an audio block) by
+   * the time streamReady resolves, we bail out — the client is driving the
+   * conversation and interleaving our events would cause Bedrock errors.
    *
-   * Ends with promptEnd so Nova knows to start generating a response.
+   * Happy-path sequence: sessionStart → promptStart → systemPrompt →
+   *   userText("hi") → promptEnd.
    */
   async sendAutoGreeting(
     sessionId: string,
@@ -146,26 +147,31 @@ export class SessionUseCase {
   ): Promise<void> {
     const session = this.requireActiveSession(sessionId);
 
-    // Only send what the client has not already sent.
+    // If the client already started a prompt it is driving the conversation.
+    // Injecting events would interleave with theirs (e.g. enqueueUserText
+    // closes any open audio block even if no audio was sent → Bedrock error).
+    if (session.isPromptStartSent) {
+      this.logger.info("Auto-greeting skipped — client already started prompt", {
+        sessionId,
+      });
+      return;
+    }
+
     if (!session.isSessionStartSent) {
       this.streaming.enqueueSessionStart(sessionId);
     }
 
-    if (!session.isPromptStartSent) {
-      this.streaming.enqueuePromptStart(sessionId);
-      // System prompt belongs inside this prompt block.
-      this.setupSystemPrompt(sessionId, systemPrompt);
-    }
-
-    // The user text is the actual trigger for Nova to generate a greeting.
+    // At this point no audio block is open, so enqueueUserText is safe.
+    this.streaming.enqueuePromptStart(sessionId);
+    this.setupSystemPrompt(sessionId, systemPrompt);
     this.streaming.enqueueUserText(sessionId, greetingText);
 
-    // promptEnd signals Nova to start generating. enqueuePromptEnd checks
-    // isPromptStartSent internally so it is always safe to call.
+    // promptEnd tells Nova to start generating its response.
     await this.streaming.enqueuePromptEnd(sessionId);
 
     this.logger.info("Auto-greeting enqueued", { sessionId, greetingText });
   }
+
 
   // ── Audio streaming ───────────────────────────────────────────────────────
 
