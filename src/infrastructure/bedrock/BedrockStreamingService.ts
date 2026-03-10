@@ -40,6 +40,23 @@ import {
   WeatherToolSchema,
 } from "../config/defaults";
 
+// ── Greeting audio chunk size ────────────────────────────────────────────────
+//
+// Nova Sonic's ASR works best with audio delivered in small chunks that
+// simulate real microphone input.  Sending the entire Polly blob as a single
+// audioInput event with interactive:true (real-time VAD mode) results in
+// speechTokens:0 because Nova's VAD never fires on a pre-queued blob.
+//
+// Fix:
+//   1. Use interactive:false  →  Nova treats audio as pre-recorded (no VAD).
+//   2. Split audio into GREETING_CHUNK_BYTES chunks  →  Nova's ASR pipeline
+//      processes each chunk in sequence, matching the expected framing.
+//
+// 3200 bytes = 100 ms of 16 kHz / 16-bit / mono LPCM (the same format as the
+// live microphone stream).  This is the same cadence Flutter sends mic audio.
+// ─────────────────────────────────────────────────────────────────────────────
+const GREETING_CHUNK_BYTES = 3200; // 100 ms per chunk
+
 @injectable()
 export class BedrockStreamingService implements IStreamingService {
   private readonly bedrockClient: BedrockRuntimeClient;
@@ -266,42 +283,69 @@ export class BedrockStreamingService implements IStreamingService {
 
   /**
    * Synthesises greetingText via Amazon Polly (LPCM 16 kHz / 16-bit / mono)
-   * and enqueues it as a complete audio content block.
+   * and enqueues it as a complete audio content block to trigger a Nova Sonic
+   * greeting response.
    *
-   * Why Polly instead of silence:
-   *   Nova Sonic responds to SPEECH.  Silence → speechTokens:0 → Nova sees an
-   *   empty user turn and generates nothing (confirmed by usageEvent logs).
-   *   Polly produces real speech energy → speechTokens > 0 → Nova responds.
+   * ── Key fixes vs. the broken approach ────────────────────────────────────
+   *
+   * BROKEN (before):
+   *   - interactive: true  →  Nova applies real-time VAD, expects continuous
+   *     live mic chunks.  A single pre-queued blob never triggers VAD end →
+   *     speechTokens: 0 → Nova stays silent.
+   *   - Single audioInput event for the whole Polly blob.
+   *
+   * FIXED (this version):
+   *   - interactive: false  →  Nova treats the audio as a complete pre-recorded
+   *     block.  No VAD; Nova's ASR processes the audio as-is when contentEnd
+   *     is received.
+   *   - Audio split into GREETING_CHUNK_BYTES (100 ms) chunks  →  matches the
+   *     framing Nova's audio pipeline expects, identical to live mic cadence.
    *
    * A dedicated greetingContentId is used so session.audioContentId (the live
-   * mic block) is never touched and isAudioContentStartSent stays false.
+   * mic block opened later) is never touched and isAudioContentStartSent stays
+   * false until the user's first real mic turn.
+   * ─────────────────────────────────────────────────────────────────────────
    */
   async enqueueGreetingAudio(sessionId: string, greetingText: string): Promise<void> {
     const session = this.requireSession(sessionId);
     const greetingContentId = randomUUID();
     const audioBase64 = await this.getOrSynthesiseGreetingAudio(greetingText);
+    const audioBuffer = Buffer.from(audioBase64, "base64");
 
+    // ── 1. Content start — pre-recorded, no VAD ───────────────────────────
     this.enqueue(sessionId, {
       event: {
         contentStart: {
           promptName: session.promptName,
           contentName: greetingContentId,
           type: "AUDIO",
-          interactive: true,
+          interactive: false,   // ← FIX: pre-recorded audio, not live mic
           role: "USER",
           audioInputConfiguration: DefaultAudioInputConfiguration,
         },
       },
     });
-    this.enqueue(sessionId, {
-      event: {
-        audioInput: {
-          promptName: session.promptName,
-          contentName: greetingContentId,
-          content: audioBase64,
+
+    // ── 2. Audio in chunks (100 ms each) ─────────────────────────────────
+    // Chunking mirrors the cadence of real microphone audio so Nova's ASR
+    // pipeline receives properly-framed audio segments.
+    let chunkCount = 0;
+    for (let offset = 0; offset < audioBuffer.length; offset += GREETING_CHUNK_BYTES) {
+      const end = Math.min(offset + GREETING_CHUNK_BYTES, audioBuffer.length);
+      const chunk = audioBuffer.subarray(offset, end);
+      this.enqueue(sessionId, {
+        event: {
+          audioInput: {
+            promptName: session.promptName,
+            contentName: greetingContentId,
+            content: chunk.toString("base64"),
+          },
         },
-      },
-    });
+      });
+      chunkCount++;
+    }
+
+    // ── 3. Content end — signals complete pre-recorded audio block ────────
     this.enqueue(sessionId, {
       event: { contentEnd: { promptName: session.promptName, contentName: greetingContentId } },
     });
@@ -309,7 +353,9 @@ export class BedrockStreamingService implements IStreamingService {
     this.logger.debug("Greeting audio enqueued", {
       sessionId,
       greetingText,
-      audioBytes: Buffer.byteLength(audioBase64, "base64"),
+      audioBytes: audioBuffer.length,
+      chunkCount,
+      chunkSizeBytes: GREETING_CHUNK_BYTES,
     });
   }
 
@@ -325,7 +371,7 @@ export class BedrockStreamingService implements IStreamingService {
           promptName: session.promptName,
           contentName: greetingContentId,
           type: "AUDIO",
-          interactive: true,
+          interactive: false,
           role: "USER",
           audioInputConfiguration: DefaultAudioInputConfiguration,
         },
@@ -422,11 +468,11 @@ export class BedrockStreamingService implements IStreamingService {
       return audioBase64;
     } catch (err) {
       this.logger.warn(
-        "Polly synthesis failed — falling back to silence (Nova may not respond). " +
-        "Ensure the IAM role has polly:SynthesizeSpeech permission.",
+        "Polly synthesis failed — Nova WILL NOT greet. " +
+        "Ensure the IAM role/user has polly:SynthesizeSpeech permission.",
         { text, err }
       );
-      // 1 s LPCM silence as last-resort fallback
+      // 1 s LPCM silence as last-resort fallback (Nova will stay silent)
       return Buffer.alloc(16_000 * 2, 0).toString("base64");
     }
   }
@@ -514,6 +560,7 @@ export class BedrockStreamingService implements IStreamingService {
 
             const nextEvent = session.queue.shift();
             const evKey = Object.keys((nextEvent as any)?.event ?? {})[0] ?? "unknown";
+
             this.logger.debug("[DEBUG] Sending event to Bedrock", {
               sessionId,
               eventType: evKey,

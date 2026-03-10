@@ -28,6 +28,18 @@ import type {
 import type { EventHandler } from "../../domain/types";
 import type { SessionData } from "../../domain/entities/Session";
 
+// ── Default greeting text ────────────────────────────────────────────────────
+//
+// "hi" (600 ms) is too short — Nova Sonic's ASR may not accumulate enough
+// speech energy to produce a reliable transcript and respond.
+//
+// A full sentence gives Polly ~2 s of speech, which is long enough for Nova's
+// ASR to confidently transcribe and for the LLM to decide to respond.
+//
+// This text is cached by Polly on first call; subsequent sessions are instant.
+// ─────────────────────────────────────────────────────────────────────────────
+const DEFAULT_GREETING_TEXT = "Hello, how are you today?";
+
 @injectable()
 export class SessionUseCase {
   constructor(
@@ -144,11 +156,19 @@ export class SessionUseCase {
    *
    * Sequence enqueued:
    *   sessionStart → promptStart → systemPrompt →
-   *   greetingAudio(Polly LPCM) → userText → promptEnd
+   *   greetingAudio(Polly LPCM, interactive:false, chunked) → userText → promptEnd
+   *
+   * Why interactive:false matters:
+   *   interactive:true = real-time VAD mode (for live mic streams).
+   *   interactive:false = pre-recorded mode (no VAD, Nova processes audio as-is).
+   *   Sending a pre-queued Polly blob with interactive:true causes speechTokens:0
+   *   because Nova's VAD never fires on a pre-packaged blob → no response.
+   *   With interactive:false, Nova's ASR processes the complete audio block
+   *   and the LLM generates a greeting response.
    */
   async preEnqueueAutoGreeting(
     sessionId: string,
-    greetingText = "hi",
+    greetingText = DEFAULT_GREETING_TEXT,
     systemPrompt?: SystemPromptRequest
   ): Promise<void> {
     const session = this.requireActiveSession(sessionId);
@@ -165,12 +185,11 @@ export class SessionUseCase {
     this.streaming.enqueuePromptStart(sessionId);
     this.setupSystemPrompt(sessionId, systemPrompt);
 
-    // Polly audio: real speech energy → Nova registers speech tokens → responds.
-    // Silence alone gives speechTokens:0 → Nova stays silent (confirmed by logs).
-    
+    // Polly audio (interactive:false, chunked) → Nova ASR transcribes the
+    // greeting → LLM generates and streams an audio response.
     await this.streaming.enqueueGreetingAudio(sessionId, greetingText);
 
-    // Text hint: reinforces intent in case ASR confidence is low on the audio.
+    // Text hint: reinforces the transcript in case ASR confidence is marginal.
     this.streaming.enqueueUserText(sessionId, greetingText);
 
     // promptEnd tells Nova to start generating. The actual queue push is
