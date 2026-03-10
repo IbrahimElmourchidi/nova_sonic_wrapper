@@ -125,14 +125,29 @@ export class SocketGateway {
       ctx.state = SessionState.ACTIVE;
       callback?.({ success: true });
 
-      // Pre-fill the queue with the full greeting sequence BEFORE startStream().
-      // bedrockClient.send() blocks until Bedrock sends its first response event.
-      // Bedrock only does that after receiving sessionStart + content.
-      // Empty queue → send() deadlock. preEnqueueAutoGreeting() breaks the cycle.
+      // Pre-queue ONLY: sessionStart + promptStart + systemPrompt.
+      // These are enough to unblock bedrockClient.send() — Bedrock returns
+      // a usageEvent for the system prompt tokens which resolves send().
       await this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
 
-      // Fire bidirectional stream — do NOT await.
+      // Open the bidirectional HTTP/2 stream — do NOT await.
       this.sessionUseCase.startStream(session.sessionId);
+
+      // ── Send greeting audio into the LIVE stream ──────────────────────────
+      //
+      // CRITICAL: wait until send() has resolved (streamReady) before sending
+      // audio.  Pre-queued audio is processed by Nova Sonic as a batch dump
+      // before its real-time VAD/response engine is active → outputTokens:0
+      // and the stream hangs indefinitely.
+      //
+      // Sending audio AFTER streamReady mirrors exactly how Turn 2+ works:
+      // the HTTP/2 channel is open, Nova Sonic is in real-time mode, VAD
+      // fires when it detects end-of-speech (or when contentEnd arrives),
+      // and the model generates a spoken response.
+      const sessionData = this.sessionUseCase.getSession(session.sessionId);
+      await sessionData.streamReady;
+
+      this.sessionUseCase.sendGreetingAudio(session.sessionId);
     } catch (err) {
       ctx.state = SessionState.CLOSED;
       this.logger.error("Failed to initialize session", {
@@ -166,6 +181,11 @@ export class SocketGateway {
 
       await this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
       this.sessionUseCase.startStream(session.sessionId);
+
+      // Same pattern as handleInitialize: send greeting into live stream
+      const sessionData = this.sessionUseCase.getSession(session.sessionId);
+      await sessionData.streamReady;
+      this.sessionUseCase.sendGreetingAudio(session.sessionId);
 
       ctx.state = SessionState.ACTIVE;
     } catch (err) {
@@ -222,9 +242,9 @@ export class SocketGateway {
       // Wait for the Bedrock stream to be established before telling the
       // client it may start sending mic audio.
       //
-      // Turn 1: resolves when bedrockClient.send() gets its first Bedrock
-      //         response — safe because preEnqueueAutoGreeting pre-filled the
-      //         queue with the full greeting sequence.
+      // Turn 1: streamReady is already resolved at this point — the greeting
+      //         audio was sent after streamReady, and the stream is still open
+      //         waiting for Nova Sonic's response.  This await returns instantly.
       //
       // Turn 2+: pre-resolved immediately in the streamComplete handler
       //          (session.resolveStreamReady() called right after reset) so

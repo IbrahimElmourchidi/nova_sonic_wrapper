@@ -129,30 +129,28 @@ export class SessionUseCase {
   // ── Auto-greeting ─────────────────────────────────────────────────────────
 
   /**
-   * Pre-fills the session queue with the greeting sequence so that when
-   * startStream() opens the HTTP/2 connection the SDK has data to transmit
-   * immediately, preventing the send() deadlock.
+   * Pre-fills the session queue with ONLY the session + system setup events
+   * needed to unblock bedrockClient.send().
    *
    * MUST be awaited BEFORE startStream().
    *
    * Sequence enqueued:
    *   sessionStart → promptStart → systemPrompt (SYSTEM TEXT)
-   *     → audioGreeting (USER AUDIO, interactive:true, pre-recorded LPCM)
    *
-   * ── Why NO promptEnd ───────────────────────────────────────────────────────
-   * promptEnd closes the prompt from the client side and causes Nova Sonic to
-   * emit only usage accounting events (outputTokens: 0).  It does NOT trigger
-   * a spoken response.
+   * ── Why NOT the audio greeting ─────────────────────────────────────────────
+   * Nova Sonic is a real-time speech model.  When audio is pre-queued and
+   * sent as a batch burst before the HTTP/2 stream opens, Nova Sonic processes
+   * the bytes for token accounting only — its VAD/response engine is not yet
+   * in real-time mode, so it never triggers response generation.
+   * (Observed: speechTokens:157, outputTokens:0, stream hangs forever.)
    *
-   * The correct pattern (mirroring normal Turn 2+) is:
-   *   contentStart(AUDIO, interactive:true) → audioInput → contentEnd
-   *   → [async iterable waits] → Nova Sonic generates audioOutput →
-   *   → response stream ends naturally → streamComplete fires.
+   * The audio greeting must be sent AFTER the stream is live.
+   * See sendGreetingAudio() and the SocketGateway call site.
    *
-   * ── Why NO userText ────────────────────────────────────────────────────────
-   * Having an interactive:false USER TEXT block immediately before the
-   * interactive:true USER AUDIO block creates two conflicting user turns.
-   * The audio alone is sufficient to seed the queue and trigger the response.
+   * ── Why this is still needed ───────────────────────────────────────────────
+   * bedrockClient.send() blocks until Bedrock sends its first response event.
+   * The system prompt alone is enough: Bedrock returns a usageEvent for those
+   * tokens, which unblocks send() and resolves session.streamReady.
    */
   async preEnqueueAutoGreeting(
     sessionId: string,
@@ -171,20 +169,29 @@ export class SessionUseCase {
     this.streaming.enqueuePromptStart(sessionId);
     this.setupSystemPrompt(sessionId, systemPrompt);
 
-    // ── Audio greeting (USER AUDIO, interactive:true) ───────────────────────
-    // contentEnd sent immediately after the audio chunk acts as the explicit
-    // end-of-speech signal (same as VAD silence detection in live turns).
-    // Nova Sonic processes the audio and streams back an audioOutput response.
-    // The async iterable stays open waiting; streamComplete fires naturally
-    // when Nova Sonic finishes its response.
+    this.logger.info("Session + system prompt pre-enqueued (stream not started yet)", {
+      sessionId,
+    });
+  }
+
+  /**
+   * Sends the pre-recorded audio greeting into the LIVE bidirectional stream.
+   *
+   * MUST be called AFTER session.streamReady resolves (i.e. after
+   * bedrockClient.send() has received its first Bedrock response and the
+   * HTTP/2 connection is fully established).
+   *
+   * Sending audio into a live stream mirrors exactly how Turn 2+ works when
+   * the user speaks.  Nova Sonic's VAD and response engine are active and
+   * process the audio in real-time, generating a spoken response.
+   */
+  sendGreetingAudio(sessionId: string): void {
+    this.requireActiveSession(sessionId);
     this.streaming.enqueueAudioGreeting(
       sessionId,
       this.greetingAudio.getLpcmBuffer()
     );
-
-    this.logger.info("Auto-greeting pre-enqueued (stream not started yet)", {
-      sessionId,
-    });
+    this.logger.info("Greeting audio sent into live stream", { sessionId });
   }
 
   /**

@@ -284,14 +284,30 @@ export class BedrockStreamingService implements IStreamingService {
   }
 
   /**
-   * Enqueues a complete, non-interactive audio block from a pre-recorded buffer.
+   * Enqueues a complete pre-recorded audio greeting as a USER turn.
    *
    * Uses a FRESH contentId (not session.audioContentId) so it is fully
    * self-contained and does not interfere with the live-mic audio block that
    * the client opens later in the same session.
    *
-   * interactive: false  →  Nova Sonic processes the full buffer immediately
-   *                         without waiting for VAD speech-end detection.
+   * WHY interactive: true
+   *   interactive: false = Nova Sonic treats the content as background context
+   *                        and produces ZERO output (outputTokens: 0).
+   *   interactive: true  = Nova Sonic treats it as a real user turn. The
+   *                        contentEnd after the final chunk acts as an explicit
+   *                        end-of-speech signal so the model does not wait for
+   *                        VAD silence detection.
+   *
+   * WHY chunked (3 200 bytes = 100 ms per chunk)
+   *   Sending a single large blob delivers all audio data instantaneously.
+   *   Nova Sonic's VAD/response engine expects audio to arrive over time, as a
+   *   real microphone streams it. Small chunks matching the mic cadence give
+   *   the model time to buffer and process incrementally — the same pattern
+   *   that works for every Turn 2+ live-mic turn.
+   *
+   * IMPORTANT: call this ONLY after session.streamReady has resolved.
+   *   Pre-queuing this audio before the HTTP/2 stream is live causes
+   *   speechTokens to be counted but outputTokens to be 0 (stream hangs).
    */
   enqueueAudioGreeting(sessionId: string, audioData: Buffer): void {
     const session = this.requireSession(sessionId);
@@ -299,13 +315,14 @@ export class BedrockStreamingService implements IStreamingService {
     // Dedicated content ID — intentionally different from session.audioContentId
     const greetingContentId = randomUUID();
 
+    // contentStart — AUDIO, interactive:true, role:USER
     this.enqueue(sessionId, {
       event: {
         contentStart: {
           promptName: session.promptName,
           contentName: greetingContentId,
           type: "AUDIO",
-          interactive: true,   
+          interactive: true,    // MUST be true — false silences Nova Sonic's response
           role: "USER",
           audioInputConfiguration: {
             audioType: "SPEECH",
@@ -319,16 +336,29 @@ export class BedrockStreamingService implements IStreamingService {
       },
     });
 
-    this.enqueue(sessionId, {
-      event: {
-        audioInput: {
-          promptName: session.promptName,
-          contentName: greetingContentId,
-          content: audioData.toString("base64"),
-        },
-      },
-    });
+    // audioInput — chunked at 3 200 bytes (100 ms @ 16 kHz 16-bit mono)
+    // to mimic real microphone streaming behaviour
+    const CHUNK_BYTES = 3200;
+    let offset = 0;
+    let chunkCount = 0;
 
+    while (offset < audioData.byteLength) {
+      const end = Math.min(offset + CHUNK_BYTES, audioData.byteLength);
+      const chunk = audioData.slice(offset, end);
+      this.enqueue(sessionId, {
+        event: {
+          audioInput: {
+            promptName: session.promptName,
+            contentName: greetingContentId,
+            content: chunk.toString("base64"),
+          },
+        },
+      });
+      offset += CHUNK_BYTES;
+      chunkCount++;
+    }
+
+    // contentEnd — explicit end-of-speech signal
     this.enqueue(sessionId, {
       event: {
         contentEnd: {
@@ -338,9 +368,10 @@ export class BedrockStreamingService implements IStreamingService {
       },
     });
 
-    this.logger.debug("Audio greeting enqueued", {
+    this.logger.debug("Audio greeting enqueued (chunked)", {
       sessionId,
       audioBytes: audioData.byteLength,
+      chunks: chunkCount,
       durationMs: Math.round((audioData.byteLength / 2 / 16_000) * 1000),
     });
   }
