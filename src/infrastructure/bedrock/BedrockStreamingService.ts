@@ -403,6 +403,24 @@ export class BedrockStreamingService implements IStreamingService {
       chunks: chunkCount,
       durationMs: Math.round((audioData.byteLength / 2 / 16_000) * 1000),
     });
+
+    // ── promptEnd — signals end of user turn to Nova Sonic ───────────────────
+    //
+    // Without promptEnd, Nova Sonic sits waiting for more events indefinitely
+    // and times out with "Timed out waiting for input events" (~60 s later).
+    //
+    // WHY NOT sessionEnd:
+    //   enqueueSessionEnd() deletes the session from the repository and fires
+    //   closeSignal, which would make the streamComplete handler crash when it
+    //   calls prepareNextStream() (session not found).  We intentionally keep
+    //   the session alive — the async iterable just idles (empty queue) while
+    //   Nova Sonic generates the greeting response, and Turn 2's sessionStart
+    //   (enqueued by prepareNextStream) wakes the iterable back up.
+    this.enqueue(sessionId, {
+      event: { promptEnd: { promptName: session.promptName } },
+    });
+
+    this.logger.debug("promptEnd enqueued after greeting audio", { sessionId });
   }
 
   async enqueueContentEnd(sessionId: string): Promise<void> {
