@@ -309,20 +309,41 @@ export class BedrockStreamingService implements IStreamingService {
    *   Pre-queuing this audio before the HTTP/2 stream is live causes
    *   speechTokens to be counted but outputTokens to be 0 (stream hangs).
    */
-  enqueueAudioGreeting(sessionId: string, audioData: Buffer): void {
+  /**
+   * Streams the pre-recorded LPCM greeting into the LIVE bidirectional stream,
+   * delivering one 100ms chunk every 100ms so Nova Sonic's VAD/response engine
+   * receives audio at real microphone cadence and generates a spoken response.
+   *
+   * WHY async with real delays (not just chunked queue items):
+   *   The async iterable drains the queue as fast as next() is called.
+   *   Even with 16 separately-enqueued chunks, all 16 items drain in ~25ms
+   *   because the SDK calls next() with no back-pressure.  Nova Sonic's VAD
+   *   receives the full 1.6s as an instant burst — its response engine never
+   *   fires — and outputTokens stays 0 while the stream hangs indefinitely.
+   *
+   *   Awaiting 100ms between each enqueue() call forces the queue to empty
+   *   before the next chunk arrives.  The async generator blocks on its
+   *   internal "queue not empty" promise until the next chunk is ready.
+   *   From Nova Sonic's perspective audio trickles in at ~100ms intervals —
+   *   identical to a live microphone — and VAD fires normally.
+   *
+   * MUST be awaited.  MUST be called after session.streamReady resolves.
+   */
+  async enqueueAudioGreeting(sessionId: string, audioData: Buffer): Promise<void> {
     const session = this.requireSession(sessionId);
 
-    // Dedicated content ID — intentionally different from session.audioContentId
+    // Dedicated content ID — separate from session.audioContentId so it does
+    // not interfere with the live-mic content block opened later.
     const greetingContentId = randomUUID();
 
-    // contentStart — AUDIO, interactive:true, role:USER
+    // contentStart
     this.enqueue(sessionId, {
       event: {
         contentStart: {
           promptName: session.promptName,
           contentName: greetingContentId,
           type: "AUDIO",
-          interactive: true,    // MUST be true — false silences Nova Sonic's response
+          interactive: true,   // MUST be true — false silences Nova Sonic
           role: "USER",
           audioInputConfiguration: {
             audioType: "SPEECH",
@@ -336,15 +357,19 @@ export class BedrockStreamingService implements IStreamingService {
       },
     });
 
-    // audioInput — chunked at 3 200 bytes (100 ms @ 16 kHz 16-bit mono)
-    // to mimic real microphone streaming behaviour
+    // audioInput — one chunk every 100ms to simulate live mic cadence.
+    // 3200 bytes = 16000 samples/s × 2 bytes/sample × 0.1s = exactly 100ms.
+    // The await forces the queue to drain between chunks so the iterable
+    // delivers audio at the same rate a microphone would.
     const CHUNK_BYTES = 3200;
+    const CHUNK_DELAY_MS = 100;
     let offset = 0;
     let chunkCount = 0;
 
     while (offset < audioData.byteLength) {
       const end = Math.min(offset + CHUNK_BYTES, audioData.byteLength);
       const chunk = audioData.slice(offset, end);
+
       this.enqueue(sessionId, {
         event: {
           audioInput: {
@@ -354,11 +379,15 @@ export class BedrockStreamingService implements IStreamingService {
           },
         },
       });
+
       offset += CHUNK_BYTES;
       chunkCount++;
+
+      // Critical: wait for this chunk to be consumed before queuing the next.
+      await this.delay(CHUNK_DELAY_MS);
     }
 
-    // contentEnd — explicit end-of-speech signal
+    // contentEnd — explicit end-of-speech signal; Nova Sonic responds immediately
     this.enqueue(sessionId, {
       event: {
         contentEnd: {
@@ -368,7 +397,7 @@ export class BedrockStreamingService implements IStreamingService {
       },
     });
 
-    this.logger.debug("Audio greeting enqueued (chunked)", {
+    this.logger.debug("Audio greeting streamed at mic cadence", {
       sessionId,
       audioBytes: audioData.byteLength,
       chunks: chunkCount,

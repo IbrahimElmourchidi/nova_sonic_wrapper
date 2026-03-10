@@ -147,7 +147,7 @@ export class SocketGateway {
       const sessionData = this.sessionUseCase.getSession(session.sessionId);
       await sessionData.streamReady;
 
-      this.sessionUseCase.sendGreetingAudio(session.sessionId);
+      await this.sessionUseCase.sendGreetingAudio(session.sessionId);
     } catch (err) {
       ctx.state = SessionState.CLOSED;
       this.logger.error("Failed to initialize session", {
@@ -185,7 +185,7 @@ export class SocketGateway {
       // Same pattern as handleInitialize: send greeting into live stream
       const sessionData = this.sessionUseCase.getSession(session.sessionId);
       await sessionData.streamReady;
-      this.sessionUseCase.sendGreetingAudio(session.sessionId);
+      await this.sessionUseCase.sendGreetingAudio(session.sessionId);
 
       ctx.state = SessionState.ACTIVE;
     } catch (err) {

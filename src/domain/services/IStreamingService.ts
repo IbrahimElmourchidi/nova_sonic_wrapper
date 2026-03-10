@@ -47,16 +47,22 @@ export interface IStreamingService {
   enqueueAudioChunk(sessionId: SessionId, audioData: Buffer): void;
 
   /**
-   * Enqueues a complete, non-interactive audio block from a pre-recorded buffer.
-   * Uses interactive:false so Nova Sonic does NOT run VAD on this content —
-   * it processes the full buffer immediately.
+   * Streams the pre-recorded LPCM greeting into the LIVE bidirectional stream,
+   * delivering one 100ms chunk every 100ms so Nova Sonic's VAD/response engine
+   * receives audio at real microphone cadence and generates a spoken response.
    *
-   * Required by Nova Sonic: every prompt must contain at least one AUDIO block.
-   * Call this during the auto-greeting sequence before enqueuePromptEnd().
+   * WHY async with real delays (not just chunked queue items):
+   *   The async iterable drains the queue as fast as next() is called —
+   *   16 chunks disappear in ~25ms regardless of chunk size.  Nova Sonic
+   *   receives the full 1.6s burst instantly, its VAD never fires, and
+   *   outputTokens remains 0.  Awaiting 100ms between each enqueue() call
+   *   forces the queue to empty between chunks, so Nova Sonic receives audio
+   *   at true microphone cadence over the actual audio duration.
    *
-   * @param audioData  Raw LPCM bytes: 16-bit signed, mono, 16 kHz.
+   * MUST be awaited at the call site.
+   * MUST be called ONLY after session.streamReady has resolved.
    */
-  enqueueAudioGreeting(sessionId: SessionId, audioData: Buffer): void;
+  enqueueAudioGreeting(sessionId: SessionId, audioData: Buffer): Promise<void>;
 
   /**
    * Enqueue the content end event for audio.

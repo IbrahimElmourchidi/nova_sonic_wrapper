@@ -185,13 +185,22 @@ export class SessionUseCase {
    * the user speaks.  Nova Sonic's VAD and response engine are active and
    * process the audio in real-time, generating a spoken response.
    */
-  sendGreetingAudio(sessionId: string): void {
+  /**
+   * Streams the pre-recorded audio greeting into the LIVE bidirectional stream.
+   *
+   * Delegates to BedrockStreamingService.enqueueAudioGreeting() which delivers
+   * one 100ms chunk every 100ms — real microphone cadence — so Nova Sonic's
+   * VAD/response engine fires and generates a spoken greeting response.
+   *
+   * MUST be awaited.  MUST be called after session.streamReady has resolved.
+   */
+  async sendGreetingAudio(sessionId: string): Promise<void> {
     this.requireActiveSession(sessionId);
-    this.streaming.enqueueAudioGreeting(
+    await this.streaming.enqueueAudioGreeting(
       sessionId,
       this.greetingAudio.getLpcmBuffer()
     );
-    this.logger.info("Greeting audio sent into live stream", { sessionId });
+    this.logger.info("Greeting audio fully streamed into live stream", { sessionId });
   }
 
   /**
