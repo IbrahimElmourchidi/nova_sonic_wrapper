@@ -58,7 +58,6 @@ export class SocketGateway {
       cleanupInProgress: false,
     });
 
-    // Heartbeat log (non-blocking)
     const heartbeat = setInterval(() => {
       this.logger.debug("Active connections", {
         count: (socket.nsp.sockets as Map<string, Socket>).size,
@@ -120,26 +119,28 @@ export class SocketGateway {
 
       const session = this.sessionUseCase.createSession(request);
       this.audioStream.initQueue(session.sessionId);
-
-      // Register event handlers BEFORE starting the stream so no events are
-      // missed between stream open and handler registration.
       this.setupSessionEventHandlers(session.sessionId, socket);
 
-      // ── Auto-greeting: pre-enqueue BEFORE startStream ──────────────────────
-      // bedrockClient.send() only resolves after Bedrock sends its first
-      // response event.  Bedrock only does that after receiving sessionStart.
+      // Respond to the client immediately so it doesn't timeout waiting for
+      // the Polly synthesis (~1-2 s on first call, instant after caching).
+      ctx.state = SessionState.ACTIVE;
+      callback?.({ success: true });
+
+      // ── Auto-greeting pre-enqueue ─────────────────────────────────────────
+      // MUST be awaited BEFORE startStream().
+      //
+      // bedrockClient.send() only resolves once Bedrock sends its first
+      // response event. Bedrock only does that after it receives sessionStart.
       // If the queue is empty when send() starts → send() blocks forever
-      // (deadlock).  Pre-filling the queue here breaks the cycle: the SDK
-      // drains sessionStart→promptStart→systemPrompt→userText→promptEnd the
-      // moment the HTTP/2 connection opens, Bedrock responds, send() resolves.
+      // (deadlock). Awaiting preEnqueueAutoGreeting() fills the queue with
+      // sessionStart → promptStart → systemPrompt → greetingAudio → userText
+      // → promptEnd so the SDK has data to transmit the instant the HTTP/2
+      // connection opens.
       // ─────────────────────────────────────────────────────────────────────
-      this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
+      await this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
 
       // Fire bidirectional stream — do NOT await.
       this.sessionUseCase.startStream(session.sessionId);
-
-      ctx.state = SessionState.ACTIVE;
-      callback?.({ success: true });
     } catch (err) {
       ctx.state = SessionState.CLOSED;
       this.logger.error("Failed to initialize session", {
@@ -174,17 +175,15 @@ export class SocketGateway {
         sessionId: socket.id,
       });
 
-      
       const session = this.sessionUseCase.createSession(request);
       this.audioStream.initQueue(session.sessionId);
       this.setupSessionEventHandlers(session.sessionId, socket);
 
-      // Same pre-enqueue pattern as handleInitialize (see comment above).
-      this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
+      // Same pre-enqueue + startStream pattern as handleInitialize.
+      await this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
       this.sessionUseCase.startStream(session.sessionId);
 
       ctx.state = SessionState.ACTIVE;
-      // ─────────────────────────────────────────────────────────────────────
     } catch (err) {
       ctx.state = SessionState.CLOSED;
       this.logger.error("Failed to start new chat", {
@@ -237,8 +236,17 @@ export class SocketGateway {
       );
 
       // Wait for the Bedrock stream to be established before telling the client
-      // to proceed. Without this, fast clients (e.g. Flutter's auto-connect flow)
-      // can send all events before the stream is ready, causing 0 output tokens.
+      // to proceed. This prevents fast clients from sending audio before the
+      // HTTP/2 connection is open.
+      //
+      // This guard works correctly for ALL turns because:
+      //   Turn 1: prepareNextStream pre-enqueues sessionStart → send() resolves
+      //           quickly → streamReady resolves → audioReady is sent fast.
+      //   Turn 2+: prepareNextStream (called in streamComplete handler) pre-
+      //            enqueues sessionStart → same fast resolution path.
+      //
+      // Without streamReady guard, audio arrives before the stream is open and
+      // is silently dropped (0 output tokens).
       const session = this.sessionUseCase.getSession(socket.id);
       await session.streamReady;
 
@@ -297,19 +305,15 @@ export class SocketGateway {
       return;
     }
 
-    // Stop accepting new audio input, but do NOT close the session.
-    // The Bedrock response stream is still running and will send audio back.
-    this.audioStream.destroyQueue(socket.id);
-
     try {
-      await this.sessionUseCase.endAudioContent(socket.id);
-      await this.sessionUseCase.endPrompt(socket.id);
-      this.logger.info("stopAudio: input ended, waiting for AI response", {
-        socketId: socket.id,
-      });
+      ctx.cleanupInProgress = true;
+      await this.gracefulClose(socket.id);
+      ctx.state = SessionState.CLOSED;
     } catch (err) {
       this.logger.error("stopAudio error", { socketId: socket.id, err });
       socket.emit("error", this.formatError(err));
+    } finally {
+      ctx.cleanupInProgress = false;
     }
   }
 
@@ -317,37 +321,29 @@ export class SocketGateway {
     socket: Socket,
     heartbeat: NodeJS.Timeout
   ): Promise<void> {
-    clearInterval(heartbeat);
     this.logger.info("Client disconnected", { socketId: socket.id });
+    clearInterval(heartbeat);
 
     const ctx = this.getContext(socket.id);
+    if (ctx.cleanupInProgress) return;
 
-    if (
-      this.sessionUseCase.isSessionActive(socket.id) &&
-      !ctx.cleanupInProgress
-    ) {
-      ctx.cleanupInProgress = true;
-      this.audioStream.destroyQueue(socket.id);
-
-      try {
-        await this.withTimeout(
-          this.gracefulClose(socket.id),
-          this.config.session.cleanupTimeoutMs - 2_000,
-          "Disconnect cleanup timeout"
-        );
+    ctx.cleanupInProgress = true;
+    try {
+      if (this.sessionUseCase.isSessionActive(socket.id)) {
+        await this.gracefulClose(socket.id);
         this.logger.info("Session cleaned up after disconnect", {
           socketId: socket.id,
         });
-      } catch (err) {
-        this.logger.error("Disconnect cleanup error", {
-          socketId: socket.id,
-          err,
-        });
-        this.sessionUseCase.forceCloseSession(socket.id);
       }
+    } catch (err) {
+      this.logger.error("Error during disconnect cleanup", {
+        socketId: socket.id,
+        err,
+      });
+    } finally {
+      ctx.cleanupInProgress = false;
+      this.contexts.delete(socket.id);
     }
-
-    this.contexts.delete(socket.id);
   }
 
   // ── Session event forwarding ──────────────────────────────────────────────
@@ -380,13 +376,23 @@ export class SocketGateway {
       // Re-initialize audio queue for the next turn's mic input.
       this.audioStream.initQueue(sessionId);
 
-      // Reset streamReady for the next turn so audioReady waits for the new stream.
+      // ── Prepare the new stream BEFORE starting it ─────────────────────────
+      // Each InvokeModelWithBidirectionalStreamCommand opens a fresh HTTP/2
+      // connection that needs its own sessionStart event. prepareNextStream()
+      // resets isSessionStartSent and pre-enqueues sessionStart so that
+      // send() has at least one event to transmit immediately, preventing the
+      // deadlock where send() waits for Bedrock which waits for sessionStart
+      // which waits for the client which waits for audioReady which waits for
+      // streamReady which waits for send() — circular block.
+      //
+      // resetStreamReady() creates a new pending Promise so handleAudioStart
+      // (await session.streamReady) correctly gates the next turn's mic start
+      // on this new stream being established.
+      // ─────────────────────────────────────────────────────────────────────
       const session = this.sessionUseCase.getSession(sessionId);
       resetStreamReady(session);
+      this.sessionUseCase.prepareNextStream(sessionId);
 
-      // The Bedrock bidirectional stream closes after every promptEnd/response
-      // cycle. Start a new stream that will drain whatever is already in the
-      // queue (or wait for the next signal).
       this.sessionUseCase.startStream(sessionId);
 
       socket.emit("turnComplete");
@@ -426,18 +432,5 @@ export class SocketGateway {
     return {
       message: err instanceof Error ? err.message : String(err),
     };
-  }
-
-  private withTimeout<T>(
-    promise: Promise<T>,
-    ms: number,
-    label: string
-  ): Promise<T> {
-    return Promise.race([
-      promise,
-      new Promise<T>((_, reject) =>
-        setTimeout(() => reject(new Error(label)), ms)
-      ),
-    ]);
   }
 }

@@ -15,7 +15,6 @@ import {
 } from "../../domain/errors";
 import {
   DefaultAudioInputConfiguration,
-  DefaultAudioOutputConfiguration,
   DefaultSystemPrompt,
   DefaultTextConfiguration,
   DefaultInferenceConfiguration,
@@ -62,8 +61,8 @@ export class SessionUseCase {
   }
 
   /**
-   * Starts the bidirectional Bedrock stream. Fire-and-forget; promise is NOT awaited
-   * by the caller so the socket handler returns immediately.
+   * Starts the bidirectional Bedrock stream. Fire-and-forget; promise is NOT
+   * awaited by the caller so the socket handler returns immediately.
    */
   startStream(sessionId: string): void {
     this.streaming.initiateStream(sessionId).catch((err) => {
@@ -130,31 +129,31 @@ export class SessionUseCase {
   // ── Auto-greeting ─────────────────────────────────────────────────────────
 
   /**
-   * Pre-fills the session queue with the full greeting event sequence so that
-   * when startStream() opens the Bedrock HTTP/2 connection the SDK immediately
-   * has events to send.
+   * Synthesises the greeting via Polly then pre-fills the session queue with
+   * the full event sequence so that when startStream() opens the HTTP/2
+   * connection the SDK has data to transmit immediately.
    *
-   * MUST be called BEFORE startStream() — this is what breaks the deadlock:
+   * MUST be awaited BEFORE startStream():
+   *   bedrockClient.send() blocks until Bedrock sends its first response.
+   *   Bedrock only responds after receiving sessionStart.
+   *   If the queue is empty when send() starts → deadlock.
+   *   Pre-filling the queue here breaks the cycle.
    *
-   *   bedrockClient.send() resolves only after Bedrock receives the first event.
-   *   Bedrock only gets events when the async-iterable queue is non-empty.
-   *   If we wait for streamReady before enqueuing (as we did before), the queue
-   *   is always empty when send() starts → send() blocks forever → deadlock.
+   * Polly is called only once per unique greetingText; subsequent calls return
+   * the cached audio instantly.
    *
-   * Sequence enqueued: sessionStart → promptStart → systemPrompt →
-   *   userText → contentEnd → promptEnd
-   *
-   * All enqueue* methods are synchronous (they just push to session.queue).
-   * The SDK drains the queue as soon as the connection is open.
+   * Sequence enqueued:
+   *   sessionStart → promptStart → systemPrompt →
+   *   greetingAudio(Polly LPCM) → userText → promptEnd
    */
-  preEnqueueAutoGreeting(
+  async preEnqueueAutoGreeting(
     sessionId: string,
-    greetingText = "hi, lets start learning",
+    greetingText = "hi",
     systemPrompt?: SystemPromptRequest
-  ): void {
+  ): Promise<void> {
     const session = this.requireActiveSession(sessionId);
 
-    // Safety: if something already put events in the queue, bail out.
+    // Safety: bail out if the queue was already seeded.
     if (session.isSessionStartSent || session.isPromptStartSent) {
       this.logger.warn("preEnqueueAutoGreeting skipped — queue already seeded", {
         sessionId,
@@ -166,22 +165,16 @@ export class SessionUseCase {
     this.streaming.enqueuePromptStart(sessionId);
     this.setupSystemPrompt(sessionId, systemPrompt);
 
-    // Nova Sonic's protocol requires every prompt to have at least one AUDIO
-    // content block — a text-only prompt is rejected. However, silence alone
-    // is not enough to make Nova speak: it hears nothing and stays quiet.
-    //
-    // The correct combination is:
-    //   1. AUDIO block (silence)  — satisfies the protocol schema requirement
-    //   2. TEXT block (greeting)  — the actual semantic trigger for Nova to
-    //                               generate a spoken response
-    //
-    // Nova processes both blocks together and responds to the text prompt
-    // while the audio block fulfils the protocol constraint.
-    this.streaming.enqueueGreetingSilence(sessionId);
+    // Polly audio: real speech energy → Nova registers speech tokens → responds.
+    // Silence alone gives speechTokens:0 → Nova stays silent (confirmed by logs).
+    
+    await this.streaming.enqueueGreetingAudio(sessionId, greetingText);
+
+    // Text hint: reinforces intent in case ASR confidence is low on the audio.
     this.streaming.enqueueUserText(sessionId, greetingText);
 
-    // promptEnd tells Nova to start generating. enqueuePromptEnd is declared
-    // async only because of a post-enqueue delay; the actual push is sync.
+    // promptEnd tells Nova to start generating. The actual queue push is
+    // synchronous; we call without awaiting the post-enqueue delay.
     void this.streaming.enqueuePromptEnd(sessionId);
 
     this.logger.info("Auto-greeting pre-enqueued (stream not started yet)", {
@@ -190,6 +183,36 @@ export class SessionUseCase {
     });
   }
 
+  /**
+   * Prepares the session for a new Bedrock stream after turnComplete.
+   *
+   * Each call to InvokeModelWithBidirectionalStreamCommand opens a brand-new
+   * HTTP/2 connection that needs its own sessionStart event. Without this,
+   * the turn-2+ queue is empty when send() starts, send() blocks waiting for
+   * Bedrock, Bedrock waits for sessionStart, sessionStart never arrives
+   * → deadlock → Flutter "cannot restart mic (timeout)".
+   *
+   * Call this BEFORE startStream() in the streamComplete handler.
+   */
+  prepareNextStream(sessionId: string): void {
+    const session = this.requireActiveSession(sessionId);
+
+    // Reset the flag so enqueueSessionStart will actually enqueue (not skip).
+    session.isSessionStartSent = false;
+
+    // Reset prompt-level IDs for the fresh turn.
+    session.promptName = randomUUID();
+    session.audioContentId = randomUUID();
+    session.isPromptStartSent = false;
+    session.isAudioContentStartSent = false;
+
+    // Pre-enqueue sessionStart so the queue is non-empty when send() starts.
+    // The client will subsequently send promptStart → systemPrompt → audioStart
+    // which enqueues the rest.
+    this.streaming.enqueueSessionStart(sessionId);
+
+    this.logger.debug("Next stream prepared — sessionStart pre-enqueued", { sessionId });
+  }
 
   // ── Audio streaming ───────────────────────────────────────────────────────
 
