@@ -137,20 +137,7 @@ export class SessionUseCase {
    * Sequence enqueued:
    *   sessionStart → promptStart → systemPrompt (SYSTEM TEXT)
    *
-   * ── Why NOT the audio greeting ─────────────────────────────────────────────
-   * Nova Sonic is a real-time speech model.  When audio is pre-queued and
-   * sent as a batch burst before the HTTP/2 stream opens, Nova Sonic processes
-   * the bytes for token accounting only — its VAD/response engine is not yet
-   * in real-time mode, so it never triggers response generation.
-   * (Observed: speechTokens:157, outputTokens:0, stream hangs forever.)
-   *
-   * The audio greeting must be sent AFTER the stream is live.
-   * See sendGreetingAudio() and the SocketGateway call site.
-   *
-   * ── Why this is still needed ───────────────────────────────────────────────
-   * bedrockClient.send() blocks until Bedrock sends its first response event.
-   * The system prompt alone is enough: Bedrock returns a usageEvent for those
-   * tokens, which unblocks send() and resolves session.streamReady.
+   * The greeting itself is sent after streamReady in sendGreetingAudio().
    */
   async preEnqueueAutoGreeting(
     sessionId: string,
@@ -175,47 +162,33 @@ export class SessionUseCase {
   }
 
   /**
-   * Sends the pre-recorded audio greeting into the LIVE bidirectional stream.
+   * Sends the greeting into the LIVE bidirectional stream after streamReady.
    *
-   * MUST be called AFTER session.streamReady resolves (i.e. after
-   * bedrockClient.send() has received its first Bedrock response and the
-   * HTTP/2 connection is fully established).
+   * Sends BOTH audio (satisfies Nova Sonic's "must include audio" API
+   * constraint) AND an interactive TEXT turn (bypasses VAD to guarantee a
+   * spoken response). See BedrockStreamingService.enqueueAudioGreeting().
    *
-   * Sending audio into a live stream mirrors exactly how Turn 2+ works when
-   * the user speaks.  Nova Sonic's VAD and response engine are active and
-   * process the audio in real-time, generating a spoken response.
-   */
-  /**
-   * Streams the pre-recorded audio greeting into the LIVE bidirectional stream.
-   *
-   * Delegates to BedrockStreamingService.enqueueAudioGreeting() which delivers
-   * one 100ms chunk every 100ms — real microphone cadence — so Nova Sonic's
-   * VAD/response engine fires and generates a spoken greeting response.
-   *
-   * MUST be awaited.  MUST be called after session.streamReady has resolved.
+   * MUST be awaited. MUST be called after session.streamReady has resolved.
    */
   async sendGreetingAudio(sessionId: string): Promise<void> {
     this.requireActiveSession(sessionId);
 
-    // ── Log greeting file details right before streaming ─────────────────────
-    // These values confirm the file was found, converted, and has real content.
-    // If lpcmSizeKB is "0.0" or durationMs is 0, the MP3 is empty/corrupt.
-    // If greetingFilePath points to the wrong directory, process.cwd() is off.
+    // Log file diagnostics so audio issues are visible in logs
     const info = this.greetingAudio.getInfo();
-    this.logger.info("Sending greeting audio into stream", {
+    this.logger.info("Sending greeting (audio + text trigger) into stream", {
       sessionId,
       greetingFilePath: info.path,
       lpcmSizeKB: info.lpcmSizeKB,
       lpcmSizeBytes: info.lpcmSizeBytes,
       durationMs: info.durationMs,
     });
-    // ─────────────────────────────────────────────────────────────────────────
 
     await this.streaming.enqueueAudioGreeting(
       sessionId,
       this.greetingAudio.getLpcmBuffer()
     );
-    this.logger.info("Greeting audio fully streamed into live stream", { sessionId });
+
+    this.logger.info("Greeting fully streamed into live stream", { sessionId });
   }
 
   /**

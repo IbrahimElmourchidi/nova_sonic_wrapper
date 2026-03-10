@@ -37,7 +37,7 @@ export interface IStreamingService {
   ): void;
 
   /**
-   * Enqueue a user text turn (role: USER, type: TEXT).
+   * Enqueue a user text turn (role: USER, type: TEXT, interactive: false).
    */
   enqueueUserText(sessionId: SessionId, content: string): void;
 
@@ -47,17 +47,27 @@ export interface IStreamingService {
   enqueueAudioChunk(sessionId: SessionId, audioData: Buffer): void;
 
   /**
-   * Streams the pre-recorded LPCM greeting into the LIVE bidirectional stream,
-   * delivering one 100ms chunk every 100ms so Nova Sonic's VAD/response engine
-   * receives audio at real microphone cadence and generates a spoken response.
+   * Enqueues a short interactive TEXT user turn (role: USER, interactive: true)
+   * that reliably triggers Nova Sonic to generate a spoken response.
    *
-   * WHY async with real delays (not just chunked queue items):
-   *   The async iterable drains the queue as fast as next() is called —
-   *   16 chunks disappear in ~25ms regardless of chunk size.  Nova Sonic
-   *   receives the full 1.6s burst instantly, its VAD never fires, and
-   *   outputTokens remains 0.  Awaiting 100ms between each enqueue() call
-   *   forces the queue to empty between chunks, so Nova Sonic receives audio
-   *   at true microphone cadence over the actual audio duration.
+   * MUST only be called after at least one audio chunk has already been
+   * enqueued in the same prompt, because Nova Sonic requires every prompt
+   * to contain audio. This method satisfies the response-generation side;
+   * the audio turn satisfies the API constraint.
+   *
+   * Does NOT enqueue promptEnd — caller is responsible for that.
+   */
+  enqueueGreetingTrigger(sessionId: SessionId, triggerText?: string): void;
+
+  /**
+   * Streams the pre-recorded LPCM greeting audio into the LIVE bidirectional
+   * stream at real microphone cadence, then appends an interactive TEXT turn
+   * in the same prompt to guarantee Nova Sonic generates a spoken response.
+   *
+   * Sends both audio (API constraint) and text (response trigger):
+   *   contentStart (AUDIO) → audioInput×N → contentEnd (AUDIO)
+   *   → contentStart (TEXT, interactive:true) → textInput → contentEnd (TEXT)
+   *   → promptEnd
    *
    * MUST be awaited at the call site.
    * MUST be called ONLY after session.streamReady has resolved.

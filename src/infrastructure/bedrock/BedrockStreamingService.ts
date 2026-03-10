@@ -221,6 +221,7 @@ export class BedrockStreamingService implements IStreamingService {
     }
 
     const contentId = randomUUID();
+
     this.enqueue(sessionId, {
       event: {
         contentStart: {
@@ -250,6 +251,51 @@ export class BedrockStreamingService implements IStreamingService {
         },
       },
     });
+  }
+
+  /**
+   * Enqueues a short interactive TEXT user turn that reliably triggers Nova
+   * Sonic to generate a spoken response. MUST only be called after the
+   * required audio turn for the same prompt has already been enqueued,
+   * because Nova Sonic requires every prompt to contain at least one audio chunk.
+   *
+   * Does NOT enqueue promptEnd — caller is responsible for that.
+   */
+  enqueueGreetingTrigger(sessionId: string, triggerText = "Hello!"): void {
+    const session = this.requireSession(sessionId);
+    const contentId = randomUUID();
+
+    this.enqueue(sessionId, {
+      event: {
+        contentStart: {
+          promptName: session.promptName,
+          contentName: contentId,
+          type: "TEXT",
+          interactive: true,   // bypasses VAD — guarantees Nova Sonic responds
+          role: "USER",
+          textInputConfiguration: { mediaType: "text/plain" },
+        },
+      },
+    });
+    this.enqueue(sessionId, {
+      event: {
+        textInput: {
+          promptName: session.promptName,
+          contentName: contentId,
+          content: triggerText,
+        },
+      },
+    });
+    this.enqueue(sessionId, {
+      event: {
+        contentEnd: {
+          promptName: session.promptName,
+          contentName: contentId,
+        },
+      },
+    });
+
+    this.logger.debug("Greeting trigger text enqueued", { sessionId, triggerText });
   }
 
   enqueueAudioContentStart(sessionId: string, audioConfig: AudioConfiguration): void {
@@ -284,66 +330,46 @@ export class BedrockStreamingService implements IStreamingService {
   }
 
   /**
-   * Enqueues a complete pre-recorded audio greeting as a USER turn.
+   * Streams the pre-recorded LPCM greeting audio into the LIVE bidirectional
+   * stream at real microphone cadence, then appends an interactive TEXT turn
+   * ("Hello!") in the same prompt to guarantee Nova Sonic generates a response.
    *
-   * Uses a FRESH contentId (not session.audioContentId) so it is fully
-   * self-contained and does not interfere with the live-mic audio block that
-   * the client opens later in the same session.
+   * ── Why both audio AND text ───────────────────────────────────────────────
+   * Nova Sonic requires every prompt to contain at least one audio chunk —
+   * a text-only prompt is rejected by the API.
    *
-   * WHY interactive: true
-   *   interactive: false = Nova Sonic treats the content as background context
-   *                        and produces ZERO output (outputTokens: 0).
-   *   interactive: true  = Nova Sonic treats it as a real user turn. The
-   *                        contentEnd after the final chunk acts as an explicit
-   *                        end-of-speech signal so the model does not wait for
-   *                        VAD silence detection.
+   * However, pre-recorded audio delivered over HTTP/2 does NOT reliably fire
+   * Nova Sonic's VAD: speech tokens are counted (inputSpeechTokens > 0) but
+   * outputSpeechTokens stays 0 and the stream ends with no audioOutput events.
    *
-   * WHY chunked (3 200 bytes = 100 ms per chunk)
-   *   Sending a single large blob delivers all audio data instantaneously.
-   *   Nova Sonic's VAD/response engine expects audio to arrive over time, as a
-   *   real microphone streams it. Small chunks matching the mic cadence give
-   *   the model time to buffer and process incrementally — the same pattern
-   *   that works for every Turn 2+ live-mic turn.
+   * Sending BOTH satisfies both constraints:
+   *   • Audio turn  → fulfils the "must include audio" API requirement.
+   *   • TEXT turn (interactive:true) → bypasses VAD, guarantees a response.
    *
-   * IMPORTANT: call this ONLY after session.streamReady has resolved.
-   *   Pre-queuing this audio before the HTTP/2 stream is live causes
-   *   speechTokens to be counted but outputTokens to be 0 (stream hangs).
-   */
-  /**
-   * Streams the pre-recorded LPCM greeting into the LIVE bidirectional stream,
-   * delivering one 100ms chunk every 100ms so Nova Sonic's VAD/response engine
-   * receives audio at real microphone cadence and generates a spoken response.
-   *
-   * WHY async with real delays (not just chunked queue items):
-   *   The async iterable drains the queue as fast as next() is called.
-   *   Even with 16 separately-enqueued chunks, all 16 items drain in ~25ms
-   *   because the SDK calls next() with no back-pressure.  Nova Sonic's VAD
-   *   receives the full 1.6s as an instant burst — its response engine never
-   *   fires — and outputTokens stays 0 while the stream hangs indefinitely.
-   *
-   *   Awaiting 100ms between each enqueue() call forces the queue to empty
-   *   before the next chunk arrives.  The async generator blocks on its
-   *   internal "queue not empty" promise until the next chunk is ready.
-   *   From Nova Sonic's perspective audio trickles in at ~100ms intervals —
-   *   identical to a live microphone — and VAD fires normally.
+   * Event sequence:
+   *   contentStart (AUDIO, interactive:true, role:USER)
+   *   → audioInput × N  (100ms cadence)
+   *   → contentEnd (AUDIO)
+   *   → contentStart (TEXT, interactive:true, role:USER)   ← triggers response
+   *   → textInput ("Hello!")
+   *   → contentEnd (TEXT)
+   *   → promptEnd
    *
    * MUST be awaited.  MUST be called after session.streamReady resolves.
    */
   async enqueueAudioGreeting(sessionId: string, audioData: Buffer): Promise<void> {
     const session = this.requireSession(sessionId);
 
-    // Dedicated content ID — separate from session.audioContentId so it does
-    // not interfere with the live-mic content block opened later.
+    // ── Step 1: Audio turn (satisfies Nova Sonic "must include audio" constraint) ──
     const greetingContentId = randomUUID();
 
-    // contentStart
     this.enqueue(sessionId, {
       event: {
         contentStart: {
           promptName: session.promptName,
           contentName: greetingContentId,
           type: "AUDIO",
-          interactive: true,   // MUST be true — false silences Nova Sonic
+          interactive: true,
           role: "USER",
           audioInputConfiguration: {
             audioType: "SPEECH",
@@ -357,10 +383,7 @@ export class BedrockStreamingService implements IStreamingService {
       },
     });
 
-    // audioInput — one chunk every 100ms to simulate live mic cadence.
-    // 3200 bytes = 16000 samples/s × 2 bytes/sample × 0.1s = exactly 100ms.
-    // The await forces the queue to drain between chunks so the iterable
-    // delivers audio at the same rate a microphone would.
+    // Stream at real mic cadence: 3200 bytes = 16000Hz × 2 bytes × 0.1s = 100ms
     const CHUNK_BYTES = 3200;
     const CHUNK_DELAY_MS = 100;
     let offset = 0;
@@ -383,11 +406,10 @@ export class BedrockStreamingService implements IStreamingService {
       offset += CHUNK_BYTES;
       chunkCount++;
 
-      // Critical: wait for this chunk to be consumed before queuing the next.
       await this.delay(CHUNK_DELAY_MS);
     }
 
-    // contentEnd — explicit end-of-speech signal; Nova Sonic responds immediately
+    // Close audio content block
     this.enqueue(sessionId, {
       event: {
         contentEnd: {
@@ -397,30 +419,27 @@ export class BedrockStreamingService implements IStreamingService {
       },
     });
 
-    this.logger.debug("Audio greeting streamed at mic cadence", {
+    this.logger.debug("Greeting audio turn enqueued at mic cadence", {
       sessionId,
       audioBytes: audioData.byteLength,
       chunks: chunkCount,
       durationMs: Math.round((audioData.byteLength / 2 / 16_000) * 1000),
     });
 
-    // ── promptEnd — signals end of user turn to Nova Sonic ───────────────────
+    // ── Step 2: Interactive text turn (bypasses VAD, guarantees Nova Sonic responds) ──
     //
-    // Without promptEnd, Nova Sonic sits waiting for more events indefinitely
-    // and times out with "Timed out waiting for input events" (~60 s later).
-    //
-    // WHY NOT sessionEnd:
-    //   enqueueSessionEnd() deletes the session from the repository and fires
-    //   closeSignal, which would make the streamComplete handler crash when it
-    //   calls prepareNextStream() (session not found).  We intentionally keep
-    //   the session alive — the async iterable just idles (empty queue) while
-    //   Nova Sonic generates the greeting response, and Turn 2's sessionStart
-    //   (enqueued by prepareNextStream) wakes the iterable back up.
+    // Pre-recorded audio over HTTP/2 fires inputSpeechTokens but NOT outputSpeechTokens.
+    // An interactive TEXT turn processes immediately and always produces audioOutput.
+    this.enqueueGreetingTrigger(sessionId);
+
+    this.logger.debug("Greeting text trigger appended after audio turn", { sessionId });
+
+    // ── Step 3: promptEnd — close the user turn ────────────────────────────────
     this.enqueue(sessionId, {
       event: { promptEnd: { promptName: session.promptName } },
     });
 
-    this.logger.debug("promptEnd enqueued after greeting audio", { sessionId });
+    this.logger.debug("promptEnd enqueued — greeting turn complete", { sessionId });
   }
 
   async enqueueContentEnd(sessionId: string): Promise<void> {
@@ -555,11 +574,7 @@ export class BedrockStreamingService implements IStreamingService {
               }
             }
 
-            if (
-              aborted ||
-              session.queue.length === 0 ||
-              !session.isActive
-            ) {
+            if (aborted || session.queue.length === 0 || !session.isActive) {
               return { value: undefined as any, done: true };
             }
 
@@ -615,9 +630,7 @@ export class BedrockStreamingService implements IStreamingService {
     try {
       for await (const event of (response as any).body) {
         if (!session.isActive) {
-          this.logger.debug("Session no longer active, stopping stream", {
-            sessionId,
-          });
+          this.logger.debug("Session no longer active, stopping stream", { sessionId });
           break;
         }
 
@@ -628,9 +641,7 @@ export class BedrockStreamingService implements IStreamingService {
 
           try {
             const parsed = JSON.parse(text);
-            const evKey = parsed?.event
-              ? Object.keys(parsed.event)[0]
-              : "non-event";
+            const evKey = parsed?.event ? Object.keys(parsed.event)[0] : "non-event";
             this.logger.info("[DEBUG] Bedrock → response event", {
               sessionId,
               chunkIndex: chunkCount,
@@ -639,20 +650,14 @@ export class BedrockStreamingService implements IStreamingService {
                 evKey === "audioOutput"
                   ? {
                       audioOutput: {
-                        contentName:
-                          parsed.event.audioOutput?.contentName,
-                        bytes: `<${
-                          (parsed.event.audioOutput?.content ?? "").length
-                        } base64-chars>`,
+                        contentName: parsed.event.audioOutput?.contentName,
+                        bytes: `<${(parsed.event.audioOutput?.content ?? "").length} base64-chars>`,
                       },
                     }
                   : parsed?.event,
             });
           } catch {
-            this.logger.info("[DEBUG] Non-JSON chunk from Bedrock", {
-              sessionId,
-              text,
-            });
+            this.logger.info("[DEBUG] Non-JSON chunk from Bedrock", { sessionId, text });
           }
 
           this.handleResponseEvent(sessionId, session, text);
@@ -689,16 +694,10 @@ export class BedrockStreamingService implements IStreamingService {
           timestamp: new Date().toISOString(),
         });
       } else {
-        this.logger.info(
-          "Response stream ended after session force-closed",
-          { sessionId }
-        );
+        this.logger.info("Response stream ended after session force-closed", { sessionId });
       }
     } catch (err) {
-      this.logger.error("Error processing response stream", {
-        sessionId,
-        err,
-      });
+      this.logger.error("Error processing response stream", { sessionId, err });
       this.dispatchEvent(sessionId, "error", {
         source: "responseStream",
         message: "Error processing response stream",
@@ -716,10 +715,7 @@ export class BedrockStreamingService implements IStreamingService {
     try {
       json = JSON.parse(rawText);
     } catch {
-      this.logger.debug("Failed to parse response chunk", {
-        sessionId,
-        rawText,
-      });
+      this.logger.debug("Failed to parse response chunk", { sessionId, rawText });
       return;
     }
 
@@ -832,11 +828,7 @@ export class BedrockStreamingService implements IStreamingService {
     this.logger.debug("Tool result enqueued", { sessionId, toolUseId });
   }
 
-  private dispatchEvent(
-    sessionId: string,
-    eventType: string,
-    data: unknown
-  ): void {
+  private dispatchEvent(sessionId: string, eventType: string, data: unknown): void {
     const session = this.sessions.findById(sessionId);
     if (!session) return;
 
@@ -845,10 +837,7 @@ export class BedrockStreamingService implements IStreamingService {
       try {
         handler(data);
       } catch (err) {
-        this.logger.error(`Handler error for event '${eventType}'`, {
-          sessionId,
-          err,
-        });
+        this.logger.error(`Handler error for event '${eventType}'`, { sessionId, err });
       }
     }
 
