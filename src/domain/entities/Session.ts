@@ -44,6 +44,10 @@ export interface SessionData {
   audioChunksSent: number;
   receivedAudioOutput: boolean;
   receivedTextOutput: boolean;
+
+  /** Incremented each time a new stream starts. Old iterators detect the
+   *  mismatch and self-terminate so they don't compete with the new one. */
+  streamGeneration: number;
 }
 
 /**
@@ -97,5 +101,6 @@ export function createSessionData(
     audioChunksSent: 0,
     receivedAudioOutput: false,
     receivedTextOutput: false,
+    streamGeneration: 0,
   };
 }

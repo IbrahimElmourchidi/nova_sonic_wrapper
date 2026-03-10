@@ -339,21 +339,23 @@ export class BedrockStreamingService implements IStreamingService {
    * reliably trigger Nova Sonic's VAD. The model counted input speech tokens
    * but produced 0 output tokens — no audioOutput events, no response.
    *
-   * FIX (v5): Send the ACTUAL greeting audio (from greeting.mp3 LPCM) in
-   * small ~100ms chunks with interactive:true so VAD detects the speech.
-   * Previous approaches using 100ms of silence all produced 0 output —
-   * Nova Sonic needs real audio energy to trigger a response.
+   * FIX (v6): Open the audio content block exactly like the live mic path
+   * and stream the greeting audio into it — but do NOT send contentEnd or
+   * promptEnd. Let VAD handle end-of-speech detection naturally, just as
+   * it does for live mic audio on Turn 2+.
    *
-   * The text trigger is kept as a non-interactive fallback hint.
+   * Previous approaches (v1–v5) all closed the turn with promptEnd, and
+   * Bedrock consistently returned 0 output tokens regardless of the
+   * interactive flag or audio content. Nova Sonic requires an OPEN audio
+   * stream to engage its real-time response engine.
+   *
+   * The audio content block uses session.audioContentId so the client's
+   * subsequent mic audio continues in the same block seamlessly.
    *
    * Event sequence:
-   *   → contentStart (AUDIO, interactive:true, role:USER)
-   *   → audioInput × N chunks (~3200 bytes each, real audio)
-   *   → contentEnd (AUDIO)
-   *   → contentStart (TEXT, interactive:false, role:USER)
-   *   → textInput ("Hello! Please greet the user warmly.")
-   *   → contentEnd (TEXT)
-   *   → promptEnd
+   *   → contentStart (AUDIO, interactive:true, role:USER) — session.audioContentId
+   *   → audioInput × N chunks (~3200 bytes each, real greeting audio)
+   *   (content block left OPEN — client mic audio continues here)
    *
    * MUST be awaited.  MUST be called after session.streamReady resolves.
    */
@@ -361,16 +363,16 @@ export class BedrockStreamingService implements IStreamingService {
     const session = this.requireSession(sessionId);
 
     const CHUNK_SIZE = 3200; // 100ms at 16 kHz, 16-bit mono
-    const greetingContentId = randomUUID();
 
-    // ── Step 1: Stream actual greeting audio with VAD enabled ─────────────
+    // Open the audio content block — same contentId as the live mic path
+    // so the client's mic audio seamlessly continues in this block.
     this.enqueue(sessionId, {
       event: {
         contentStart: {
           promptName: session.promptName,
-          contentName: greetingContentId,
+          contentName: session.audioContentId,
           type: "AUDIO",
-          interactive: true,  // enable VAD — detects speech in the audio
+          interactive: true,
           role: "USER",
           audioInputConfiguration: {
             audioType: "SPEECH",
@@ -383,8 +385,9 @@ export class BedrockStreamingService implements IStreamingService {
         },
       },
     });
+    session.isAudioContentStartSent = true;
 
-    // Send audio in ~100ms chunks to mimic real-time streaming
+    // Send greeting audio in ~100ms chunks
     let chunkCount = 0;
     for (let offset = 0; offset < audioData.length; offset += CHUNK_SIZE) {
       const chunk = audioData.subarray(offset, offset + CHUNK_SIZE);
@@ -392,7 +395,7 @@ export class BedrockStreamingService implements IStreamingService {
         event: {
           audioInput: {
             promptName: session.promptName,
-            contentName: greetingContentId,
+            contentName: session.audioContentId,
             content: chunk.toString("base64"),
           },
         },
@@ -400,32 +403,15 @@ export class BedrockStreamingService implements IStreamingService {
       chunkCount++;
     }
 
-    this.enqueue(sessionId, {
-      event: {
-        contentEnd: {
-          promptName: session.promptName,
-          contentName: greetingContentId,
-        },
-      },
-    });
-
-    this.logger.debug("Greeting audio enqueued", {
+    this.logger.debug("Greeting audio enqueued (content block left open for mic)", {
       sessionId,
       totalBytes: audioData.length,
       chunks: chunkCount,
     });
 
-    // ── Step 2: Non-interactive TEXT trigger ───────────────────────────────
-    this.enqueueGreetingTrigger(sessionId, "Hello! Please greet the user warmly.");
-
-    this.logger.debug("Greeting text trigger appended after audio", { sessionId });
-
-    // ── Step 3: promptEnd — close the user turn ───────────────────────────
-    this.enqueue(sessionId, {
-      event: { promptEnd: { promptName: session.promptName } },
-    });
-
-    this.logger.debug("promptEnd enqueued — greeting turn complete", { sessionId });
+    // NO contentEnd, NO text trigger, NO promptEnd.
+    // VAD will detect end-of-speech and trigger the model's response.
+    // Client mic audio continues in the same audio content block.
   }
 
   async enqueueContentEnd(sessionId: string): Promise<void> {
@@ -541,6 +527,7 @@ export class BedrockStreamingService implements IStreamingService {
     }
 
     let aborted = false;
+    const myGeneration = session.streamGeneration;
 
     return {
       [Symbol.asyncIterator]: () => ({
@@ -552,10 +539,13 @@ export class BedrockStreamingService implements IStreamingService {
             // A stale queueSignal can wake us with an empty queue;
             // we simply go back to waiting instead of returning done.
             while (true) {
-              if (aborted || !session.isActive || !this.sessions.has(sessionId)) {
+              if (aborted || !session.isActive || !this.sessions.has(sessionId)
+                  || session.streamGeneration !== myGeneration) {
                 this.logger.debug("[DEBUG] Iterable returning done:true", {
                   sessionId,
-                  reason: aborted ? "aborted" : !session.isActive ? "session_inactive" : "session_not_found",
+                  reason: aborted ? "aborted"
+                    : session.streamGeneration !== myGeneration ? "generation_changed"
+                    : !session.isActive ? "session_inactive" : "session_not_found",
                 });
                 return { value: undefined as any, done: true };
               }

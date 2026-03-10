@@ -117,7 +117,16 @@ export class SessionUseCase {
   }
 
   setupAudioStart(sessionId: string, dto: AudioStartDto = {}): void {
-    this.requireActiveSession(sessionId);
+    const session = this.requireActiveSession(sessionId);
+
+    // Skip if the greeting already opened the audio content block
+    if (session.isAudioContentStartSent) {
+      this.logger.debug("Audio start skipped — content block already open (greeting)", {
+        sessionId,
+      });
+      return;
+    }
+
     const audioConfig = {
       ...DefaultAudioInputConfiguration,
       ...dto.audioConfig,
@@ -200,6 +209,11 @@ export class SessionUseCase {
    */
   prepareNextStream(sessionId: string): void {
     const session = this.requireActiveSession(sessionId);
+
+    // Increment generation so the old stream's async iterable self-terminates
+    session.streamGeneration++;
+    // Drain any leftover events from the previous turn
+    session.queue.length = 0;
 
     session.isSessionStartSent = false;
     session.promptName = randomUUID();
