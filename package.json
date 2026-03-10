@@ -15,6 +15,7 @@
     "stopBackend": "pm2 stop nova-wrapper",
     "deleteBackend": "pm2 delete nova-wrapper",
     "deleteAllBackend": "pm2 delete all",
+    "refresh":"npm run build && pm2 restart nova-wrapper",
     "showLogs": "pm2 logs nova-wrapper --lines 100"
   },
   "dependencies": {
