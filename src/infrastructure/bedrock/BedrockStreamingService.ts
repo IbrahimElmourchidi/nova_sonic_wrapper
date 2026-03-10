@@ -330,26 +330,35 @@ export class BedrockStreamingService implements IStreamingService {
   }
 
   /**
-   * Streams the pre-recorded LPCM greeting audio into the LIVE bidirectional
-   * stream at real microphone cadence, then appends an interactive TEXT turn
-   * ("Hello!") in the same prompt to guarantee Nova Sonic generates a response.
+   * ── FIX: Redesigned greeting strategy ─────────────────────────────────────
    *
-   * ── Why both audio AND text ───────────────────────────────────────────────
-   * Nova Sonic requires every prompt to contain at least one audio chunk —
-   * a text-only prompt is rejected by the API.
+   * PROBLEM:
+   * Streaming 1.6s of pre-recorded greeting audio at real mic cadence did NOT
+   * reliably trigger Nova Sonic's VAD. The model counted input speech tokens
+   * but produced 0 output tokens — no audioOutput events, no response.
    *
-   * However, pre-recorded audio delivered over HTTP/2 does NOT reliably fire
-   * Nova Sonic's VAD: speech tokens are counted (inputSpeechTokens > 0) but
-   * outputSpeechTokens stays 0 and the stream ends with no audioOutput events.
+   * ROOT CAUSE:
+   * Pre-recorded audio delivered over HTTP/2 does not fire Nova Sonic's VAD
+   * the same way live microphone audio does. Even with an interactive TEXT
+   * turn appended, having a long AUDIO block in the same prompt appeared to
+   * make Nova Sonic apply speech-model output logic (VAD-dependent) rather
+   * than the text-model forced-response logic.
    *
-   * Sending BOTH satisfies both constraints:
-   *   • Audio turn  → fulfils the "must include audio" API requirement.
-   *   • TEXT turn (interactive:true) → bypasses VAD, guarantees a response.
+   * FIX:
+   * 1. Send a MINIMAL silent audio chunk (100ms of zeros = 3200 bytes).
+   *    This satisfies the "must include audio" API constraint without
+   *    confusing the VAD / output decision engine.
+   * 2. The interactive TEXT turn ("Hello!") is the sole response trigger.
+   *    With only minimal silent audio, Nova Sonic treats the TEXT turn as
+   *    the primary input and always generates a spoken response.
+   * 3. A small delay (200ms) between audio close and text open gives
+   *    Nova Sonic time to process the audio block before the text arrives.
    *
    * Event sequence:
-   *   contentStart (AUDIO, interactive:true, role:USER)
-   *   → audioInput × N  (100ms cadence)
+   *   contentStart (AUDIO, interactive:false, role:USER)
+   *   → audioInput (100ms silence)
    *   → contentEnd (AUDIO)
+   *   → [200ms delay]
    *   → contentStart (TEXT, interactive:true, role:USER)   ← triggers response
    *   → textInput ("Hello!")
    *   → contentEnd (TEXT)
@@ -357,10 +366,16 @@ export class BedrockStreamingService implements IStreamingService {
    *
    * MUST be awaited.  MUST be called after session.streamReady resolves.
    */
-  async enqueueAudioGreeting(sessionId: string, audioData: Buffer): Promise<void> {
+  async enqueueAudioGreeting(sessionId: string, _audioData: Buffer): Promise<void> {
     const session = this.requireSession(sessionId);
 
-    // ── Step 1: Audio turn (satisfies Nova Sonic "must include audio" constraint) ──
+    // ── Step 1: Minimal silent AUDIO content ────────────────────────────────
+    // 100ms of silence at 16 kHz, 16-bit mono = 3200 bytes of zeros.
+    // This is the smallest chunk that satisfies the API's "must include audio"
+    // constraint without producing enough speech energy to confuse the VAD.
+    const SILENT_CHUNK_BYTES = 3200;
+    const SILENT_CHUNK = Buffer.alloc(SILENT_CHUNK_BYTES); // all zeros = silence
+
     const greetingContentId = randomUUID();
 
     this.enqueue(sessionId, {
@@ -369,7 +384,7 @@ export class BedrockStreamingService implements IStreamingService {
           promptName: session.promptName,
           contentName: greetingContentId,
           type: "AUDIO",
-          interactive: true,
+          interactive: false,   // NOT interactive — just a placeholder to satisfy API
           role: "USER",
           audioInputConfiguration: {
             audioType: "SPEECH",
@@ -383,33 +398,17 @@ export class BedrockStreamingService implements IStreamingService {
       },
     });
 
-    // Stream at real mic cadence: 3200 bytes = 16000Hz × 2 bytes × 0.1s = 100ms
-    const CHUNK_BYTES = 3200;
-    const CHUNK_DELAY_MS = 100;
-    let offset = 0;
-    let chunkCount = 0;
-
-    while (offset < audioData.byteLength) {
-      const end = Math.min(offset + CHUNK_BYTES, audioData.byteLength);
-      const chunk = audioData.slice(offset, end);
-
-      this.enqueue(sessionId, {
-        event: {
-          audioInput: {
-            promptName: session.promptName,
-            contentName: greetingContentId,
-            content: chunk.toString("base64"),
-          },
+    this.enqueue(sessionId, {
+      event: {
+        audioInput: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+          content: SILENT_CHUNK.toString("base64"),
         },
-      });
+      },
+    });
 
-      offset += CHUNK_BYTES;
-      chunkCount++;
-
-      await this.delay(CHUNK_DELAY_MS);
-    }
-
-    // Close audio content block
+    // Close the audio content block
     this.enqueue(sessionId, {
       event: {
         contentEnd: {
@@ -419,22 +418,20 @@ export class BedrockStreamingService implements IStreamingService {
       },
     });
 
-    this.logger.debug("Greeting audio turn enqueued at mic cadence", {
+    this.logger.debug("Greeting silent audio enqueued (100ms silence)", {
       sessionId,
-      audioBytes: audioData.byteLength,
-      chunks: chunkCount,
-      durationMs: Math.round((audioData.byteLength / 2 / 16_000) * 1000),
+      silentBytes: SILENT_CHUNK_BYTES,
     });
 
-    // ── Step 2: Interactive text turn (bypasses VAD, guarantees Nova Sonic responds) ──
-    //
-    // Pre-recorded audio over HTTP/2 fires inputSpeechTokens but NOT outputSpeechTokens.
-    // An interactive TEXT turn processes immediately and always produces audioOutput.
-    this.enqueueGreetingTrigger(sessionId);
+    // Brief delay to let Nova Sonic process the audio block before text arrives
+    await this.delay(200);
 
-    this.logger.debug("Greeting text trigger appended after audio turn", { sessionId });
+    // ── Step 2: Interactive TEXT turn (bypasses VAD, guarantees response) ────
+    this.enqueueGreetingTrigger(sessionId, "Hello! Please greet the user warmly.");
 
-    // ── Step 3: promptEnd — close the user turn ────────────────────────────────
+    this.logger.debug("Greeting text trigger appended after silent audio", { sessionId });
+
+    // ── Step 3: promptEnd — close the user turn ────────────────────────────
     this.enqueue(sessionId, {
       event: { promptEnd: { promptName: session.promptName } },
     });
@@ -532,6 +529,16 @@ export class BedrockStreamingService implements IStreamingService {
     return event;
   }
 
+  /**
+   * ── FIX: Reduced log noise for audioInput events ──────────────────────────
+   *
+   * Previously, every single audioInput chunk (~100ms of mic audio) produced
+   * a DEBUG log line. With 10 chunks/second, this created ~80 lines per 8s
+   * of speech — drowning out meaningful events.
+   *
+   * Now: audioInput events are sampled (logged every 50th chunk) with a
+   * running count. All other event types are still logged individually.
+   */
   private buildAsyncIterable(
     sessionId: string
   ): AsyncIterable<InvokeModelWithBidirectionalStreamInput> {
@@ -582,11 +589,24 @@ export class BedrockStreamingService implements IStreamingService {
             const evKey =
               Object.keys((nextEvent as any)?.event ?? {})[0] ?? "unknown";
 
-            this.logger.debug("[DEBUG] Sending event to Bedrock", {
-              sessionId,
-              eventType: evKey,
-              remainingQueue: session.queue.length,
-            });
+            // ── FIX: Sampled logging for audioInput ─────────────────────────
+            if (evKey === "audioInput") {
+              session.audioChunksSent = (session.audioChunksSent ?? 0) + 1;
+              // Log every 50th chunk, plus the 1st one
+              if (session.audioChunksSent === 1 || session.audioChunksSent % 50 === 0) {
+                this.logger.debug("[DEBUG] Sending audioInput to Bedrock", {
+                  sessionId,
+                  totalChunksSent: session.audioChunksSent,
+                  remainingQueue: session.queue.length,
+                });
+              }
+            } else {
+              this.logger.debug("[DEBUG] Sending event to Bedrock", {
+                sessionId,
+                eventType: evKey,
+                remainingQueue: session.queue.length,
+              });
+            }
 
             return {
               value: {
@@ -615,6 +635,13 @@ export class BedrockStreamingService implements IStreamingService {
     };
   }
 
+  /**
+   * ── FIX: Enhanced response tracking ───────────────────────────────────────
+   *
+   * Now tracks whether audioOutput / textOutput events were received during
+   * the response stream. This makes it immediately obvious in logs when
+   * Nova Sonic produces 0 output tokens (the greeting bug).
+   */
   private async processResponseStream(
     sessionId: string,
     response: Awaited<ReturnType<BedrockRuntimeClient["send"]>> & {
@@ -626,6 +653,8 @@ export class BedrockStreamingService implements IStreamingService {
 
     const decoder = new TextDecoder();
     let chunkCount = 0;
+    let audioOutputCount = 0;
+    let textOutputCount = 0;
 
     try {
       for await (const event of (response as any).body) {
@@ -642,6 +671,11 @@ export class BedrockStreamingService implements IStreamingService {
           try {
             const parsed = JSON.parse(text);
             const evKey = parsed?.event ? Object.keys(parsed.event)[0] : "non-event";
+
+            // Track output types for diagnostics
+            if (evKey === "audioOutput") audioOutputCount++;
+            if (evKey === "textOutput") textOutputCount++;
+
             this.logger.info("[DEBUG] Bedrock → response event", {
               sessionId,
               chunkIndex: chunkCount,
@@ -682,11 +716,28 @@ export class BedrockStreamingService implements IStreamingService {
         }
       }
 
+      // ── FIX: Enhanced end-of-stream diagnostics ───────────────────────────
+      session.receivedAudioOutput = audioOutputCount > 0;
+      session.receivedTextOutput = textOutputCount > 0;
+
       this.logger.info("[DEBUG] Response loop ended", {
         sessionId,
         totalChunks: chunkCount,
+        audioOutputChunks: audioOutputCount,
+        textOutputChunks: textOutputCount,
+        hadAudioOutput: audioOutputCount > 0,
+        hadTextOutput: textOutputCount > 0,
         isActive: session.isActive,
       });
+
+      if (audioOutputCount === 0 && textOutputCount === 0 && chunkCount > 0) {
+        this.logger.warn(
+          "⚠ Nova Sonic produced ZERO output (no audioOutput, no textOutput). " +
+            "The model processed input tokens but did not generate a response. " +
+            "This typically means the greeting/VAD strategy failed.",
+          { sessionId, totalInputChunks: chunkCount }
+        );
+      }
 
       if (session.isActive) {
         this.logger.info("Response stream complete", { sessionId });

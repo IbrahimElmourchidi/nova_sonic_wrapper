@@ -175,7 +175,7 @@ export class SessionUseCase {
 
     // Log file diagnostics so audio issues are visible in logs
     const info = this.greetingAudio.getInfo();
-    this.logger.info("Sending greeting (audio + text trigger) into stream", {
+    this.logger.info("Sending greeting (silent audio + text trigger) into stream", {
       sessionId,
       greetingFilePath: info.path,
       lpcmSizeKB: info.lpcmSizeKB,
@@ -206,6 +206,11 @@ export class SessionUseCase {
     session.audioContentId = randomUUID();
     session.isPromptStartSent = false;
     session.isAudioContentStartSent = false;
+
+    // Reset per-turn response tracking counters
+    session.audioChunksSent = 0;
+    session.receivedAudioOutput = false;
+    session.receivedTextOutput = false;
 
     this.streaming.enqueueSessionStart(sessionId);
 

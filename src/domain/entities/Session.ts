@@ -39,6 +39,11 @@ export interface SessionData {
   resolveStreamReady: () => void;
   /** Rejects streamReady — called by the streaming service on fatal stream error. */
   rejectStreamReady: (err: unknown) => void;
+
+  // ── Per-turn response tracking (FIX: helps diagnose zero-output issues) ──
+  audioChunksSent: number;
+  receivedAudioOutput: boolean;
+  receivedTextOutput: boolean;
 }
 
 /**
@@ -88,5 +93,9 @@ export function createSessionData(
     streamReady,
     resolveStreamReady,
     rejectStreamReady,
+    // Per-turn tracking
+    audioChunksSent: 0,
+    receivedAudioOutput: false,
+    receivedTextOutput: false,
   };
 }
