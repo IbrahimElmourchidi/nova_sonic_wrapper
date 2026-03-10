@@ -47,6 +47,18 @@ export interface IStreamingService {
   enqueueAudioChunk(sessionId: SessionId, audioData: Buffer): void;
 
   /**
+   * Enqueues a complete, non-interactive audio block from a pre-recorded buffer.
+   * Uses interactive:false so Nova Sonic does NOT run VAD on this content —
+   * it processes the full buffer immediately.
+   *
+   * Required by Nova Sonic: every prompt must contain at least one AUDIO block.
+   * Call this during the auto-greeting sequence before enqueuePromptEnd().
+   *
+   * @param audioData  Raw LPCM bytes: 16-bit signed, mono, 16 kHz.
+   */
+  enqueueAudioGreeting(sessionId: SessionId, audioData: Buffer): void;
+
+  /**
    * Enqueue the content end event for audio.
    */
   enqueueContentEnd(sessionId: SessionId): Promise<void>;

@@ -283,6 +283,68 @@ export class BedrockStreamingService implements IStreamingService {
     });
   }
 
+  /**
+   * Enqueues a complete, non-interactive audio block from a pre-recorded buffer.
+   *
+   * Uses a FRESH contentId (not session.audioContentId) so it is fully
+   * self-contained and does not interfere with the live-mic audio block that
+   * the client opens later in the same session.
+   *
+   * interactive: false  →  Nova Sonic processes the full buffer immediately
+   *                         without waiting for VAD speech-end detection.
+   */
+  enqueueAudioGreeting(sessionId: string, audioData: Buffer): void {
+    const session = this.requireSession(sessionId);
+
+    // Dedicated content ID — intentionally different from session.audioContentId
+    const greetingContentId = randomUUID();
+
+    this.enqueue(sessionId, {
+      event: {
+        contentStart: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+          type: "AUDIO",
+          interactive: false,   // process whole buffer; do NOT run VAD
+          role: "USER",
+          audioInputConfiguration: {
+            audioType: "SPEECH",
+            encoding: "base64",
+            mediaType: "audio/lpcm",
+            sampleRateHertz: 16000,
+            sampleSizeBits: 16,
+            channelCount: 1,
+          },
+        },
+      },
+    });
+
+    this.enqueue(sessionId, {
+      event: {
+        audioInput: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+          content: audioData.toString("base64"),
+        },
+      },
+    });
+
+    this.enqueue(sessionId, {
+      event: {
+        contentEnd: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+        },
+      },
+    });
+
+    this.logger.debug("Audio greeting enqueued", {
+      sessionId,
+      audioBytes: audioData.byteLength,
+      durationMs: Math.round((audioData.byteLength / 2 / 16_000) * 1000),
+    });
+  }
+
   async enqueueContentEnd(sessionId: string): Promise<void> {
     const session = this.requireSession(sessionId);
     this.enqueue(sessionId, {

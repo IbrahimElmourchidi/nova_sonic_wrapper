@@ -8,6 +8,7 @@ import { WinstonLogger } from "../logging/WinstonLogger";
 import { InMemorySessionRepository } from "../repositories/InMemorySessionRepository";
 import { BedrockStreamingService } from "../bedrock/BedrockStreamingService";
 import { ToolService } from "../tools/ToolService";
+import { GreetingAudioService } from "../audio/GreetingAudioService";
 import { SessionUseCase } from "../../application/use-cases/SessionUseCase";
 import { AudioStreamUseCase } from "../../application/use-cases/AudioStreamUseCase";
 import type { ILogger } from "../logging/ILogger";
@@ -43,6 +44,12 @@ export function buildContainer(env: NodeJS.ProcessEnv = process.env) {
   container.registerSingleton<IStreamingService>(
     TOKENS.StreamingService,
     BedrockStreamingService
+  );
+
+  // Greeting audio service — converts MP3 once at startup, caches LPCM buffer
+  container.registerSingleton<GreetingAudioService>(
+    TOKENS.GreetingAudioService,
+    GreetingAudioService
   );
 
   // Application use cases

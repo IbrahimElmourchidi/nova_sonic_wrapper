@@ -7,6 +7,7 @@ import { TOKENS } from "../../infrastructure/config/tokens";
 import type { ISessionRepository } from "../../domain/repositories/ISessionRepository";
 import type { IStreamingService } from "../../domain/services/IStreamingService";
 import type { ILogger } from "../../infrastructure/logging/ILogger";
+import { GreetingAudioService } from "../../infrastructure/audio/GreetingAudioService";
 
 import {
   SessionNotFoundError,
@@ -28,15 +29,11 @@ import type {
 import type { EventHandler } from "../../domain/types";
 import type { SessionData } from "../../domain/entities/Session";
 
-// ── Default greeting ──────────────────────────────────────────────────────────
+// ── Default greeting text ──────────────────────────────────────────────────────
 //
-// Nova Sonic responds to TEXT user messages immediately and reliably.
-// No audio, no Polly, no VAD edge cases needed.
-//
-// Audio-based greeting history (for reference):
-//   interactive:true  + single Polly blob  → speechTokens:0   (VAD never fires)
-//   interactive:false + chunked Polly      → speechTokens:157, outputTokens:0
-//                                            (interactive:false = "don't respond")
+// Sent as a USER TEXT block alongside the pre-recorded audio greeting.
+// Nova Sonic will respond to whichever carries more semantic intent — in
+// practice it hears the audio and replies to that.
 // ─────────────────────────────────────────────────────────────────────────────
 const DEFAULT_GREETING_TEXT = "Hello, how are you today?";
 
@@ -50,7 +47,10 @@ export class SessionUseCase {
     private readonly streaming: IStreamingService,
 
     @inject(TOKENS.Logger)
-    private readonly logger: ILogger
+    private readonly logger: ILogger,
+
+    @inject(TOKENS.GreetingAudioService)
+    private readonly greetingAudio: GreetingAudioService
   ) {}
 
   // ── Session lifecycle ─────────────────────────────────────────────────────
@@ -135,14 +135,17 @@ export class SessionUseCase {
   // ── Auto-greeting ─────────────────────────────────────────────────────────
 
   /**
-   * Pre-fills the session queue with a text-based greeting so that when
+   * Pre-fills the session queue with the full greeting sequence so that when
    * startStream() opens the HTTP/2 connection the SDK has data to transmit
    * immediately, preventing the send() deadlock.
    *
    * MUST be awaited BEFORE startStream().
    *
    * Sequence enqueued:
-   *   sessionStart → promptStart → systemPrompt → userText → promptEnd
+   *   sessionStart → promptStart → systemPrompt (TEXT)
+   *     → userText (TEXT, optional fallback)
+   *     → audioGreeting (AUDIO, pre-recorded LPCM) ← satisfies Nova Sonic requirement
+   *     → promptEnd
    */
   async preEnqueueAutoGreeting(
     sessionId: string,
@@ -162,6 +165,16 @@ export class SessionUseCase {
     this.streaming.enqueuePromptStart(sessionId);
     this.setupSystemPrompt(sessionId, systemPrompt);
     this.streaming.enqueueUserText(sessionId, greetingText);
+
+    // ── Audio block (required by Nova Sonic) ────────────────────────────────
+    // Every prompt must contain at least one AUDIO content block.
+    // We send the pre-recorded greeting (converted from MP3 at startup).
+    // interactive:false → Nova Sonic processes the full buffer without VAD.
+    this.streaming.enqueueAudioGreeting(
+      sessionId,
+      this.greetingAudio.getLpcmBuffer()
+    );
+
     void this.streaming.enqueuePromptEnd(sessionId);
 
     this.logger.info("Auto-greeting pre-enqueued (stream not started yet)", {

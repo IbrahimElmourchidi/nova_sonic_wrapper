@@ -16,4 +16,5 @@ export const TOKENS = {
   BedrockClient: Symbol("BedrockClient"),
   AppConfig: Symbol("AppConfig"),
   Logger: Symbol("ILogger"),
+  GreetingAudioService: Symbol("GreetingAudioService"),
 } as const;

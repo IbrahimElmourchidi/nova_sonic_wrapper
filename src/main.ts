@@ -7,6 +7,7 @@ import { HealthRouter } from "./presentation/http/HealthRouter";
 import { SocketGateway } from "./presentation/websocket/SocketGateway";
 import { TOKENS } from "./infrastructure/config/tokens";
 import { SessionUseCase } from "./application/use-cases/SessionUseCase";
+import { GreetingAudioService } from "./infrastructure/audio/GreetingAudioService";
 import type { ILogger } from "./infrastructure/logging/ILogger";
 
 async function bootstrap(): Promise<void> {
@@ -15,6 +16,17 @@ async function bootstrap(): Promise<void> {
 
   // Manually resolve classes that need tsyringe injection
   const logger = ioc.resolve<ILogger>(TOKENS.Logger);
+
+  // ── Convert greeting.mp3 → LPCM once before accepting any connections ──────
+  // This must complete before the server starts listening so that every
+  // subsequent call to greetingAudio.getLpcmBuffer() is guaranteed to succeed.
+  // If greeting.mp3 is missing or FFmpeg fails, the process exits here with a
+  // clear error message rather than failing silently on the first connection.
+  const greetingAudio = ioc.resolve<GreetingAudioService>(
+    TOKENS.GreetingAudioService
+  );
+  await greetingAudio.initialize();
+
   const sessionUseCase = ioc.resolve<SessionUseCase>(TOKENS.SessionUseCase);
   const healthRouter = ioc.resolve(HealthRouter);
   const socketGateway = ioc.resolve(SocketGateway);
