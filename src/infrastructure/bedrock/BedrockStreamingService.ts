@@ -23,10 +23,10 @@ import type { AudioConfiguration, TextConfiguration } from "../../domain/types";
 import type { SessionData } from "../../domain/entities/Session";
 import { StreamingError, SessionNotFoundError } from "../../domain/errors";
 import {
+  DefaultAudioInputConfiguration,
   DefaultAudioOutputConfiguration,
   DefaultToolSchema,
   WeatherToolSchema,
-  DefaultAudioInputConfiguration,
 } from "../config/defaults";
 
 @injectable()
@@ -61,65 +61,6 @@ export class BedrockStreamingService implements IStreamingService {
     });
   }
 
-  enqueueGreetingSilence(sessionId: string): void {
-    const session = this.requireSession(sessionId);
-
-    // Use a dedicated content ID so it never collides with the live mic block.
-    // randomUUID is already imported at the top of BedrockStreamingService
-    const greetingContentId = randomUUID();
-
-    const SILENCE_MS        = 1000;  // 1 s — long enough to reliably trigger Nova's VAD response
-    const SAMPLE_RATE       = 16_000;   // Hz  — must match DefaultAudioInputConfiguration
-    const BYTES_PER_SAMPLE  = 2;        // 16-bit
-    const CHANNELS          = 1;        // mono
-    const silenceBytes      = Math.ceil(SILENCE_MS / 1000 * SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS);
-    const silenceBase64     = Buffer.alloc(silenceBytes, 0).toString("base64");
-
-    // 1. Open the audio content block (non-interactive — one-shot input)
-    this.enqueue(sessionId, {
-      event: {
-        contentStart: {
-          promptName:             session.promptName,
-          contentName:            greetingContentId,
-          type:                   "AUDIO",
-          interactive:            true,   // Must be true — tells Nova to respond to this turn
-          role:                   "USER",
-          audioInputConfiguration: DefaultAudioInputConfiguration,
-        },
-      },
-    });
-
-    // 2. Send the silence payload
-    this.enqueue(sessionId, {
-      event: {
-        audioInput: {
-          promptName:  session.promptName,
-          contentName: greetingContentId,
-          content:     silenceBase64,
-        },
-      },
-    });
-
-    // 3. Close the audio content block
-    this.enqueue(sessionId, {
-      event: {
-        contentEnd: {
-          promptName:  session.promptName,
-          contentName: greetingContentId,
-        },
-      },
-    });
-
-    this.logger.debug("Greeting silence enqueued", {
-      sessionId,
-      silenceMs:    SILENCE_MS,
-      silenceBytes,
-    });
-  }
-
-
-
-
   // ── IStreamingService implementation ────────────────────────────────────
 
   async initiateStream(sessionId: string): Promise<void> {
@@ -128,6 +69,26 @@ export class BedrockStreamingService implements IStreamingService {
 
     try {
       this.logger.info("Initiating bidirectional stream", { sessionId });
+
+      // ── DEBUG: snapshot the full outbound queue before the stream opens ──
+      this.logger.info("[DEBUG] Queue snapshot before send()", {
+        sessionId,
+        queueLength: session.queue.length,
+        events: (session.queue as Array<unknown>).map((e: any) => {
+          const ev = e?.event ?? {};
+          const key = Object.keys(ev)[0] ?? "unknown";
+          const val = ev[key] as Record<string, unknown> ?? {};
+          if (key === "audioInput") {
+            return {
+              [key]: {
+                ...val,
+                content: `<${Buffer.byteLength(val.content as string, "base64")} bytes>`,
+              },
+            };
+          }
+          return { [key]: val };
+        }),
+      });
 
       const asyncIterable = this.buildAsyncIterable(sessionId);
 
@@ -138,19 +99,21 @@ export class BedrockStreamingService implements IStreamingService {
         })
       );
 
-      this.logger.info("Stream established, processing responses", {
+      this.logger.info("Stream established, processing responses", { sessionId });
+
+      // ── DEBUG: how many events were left unsent after send() resolved ────
+      this.logger.info("[DEBUG] Queue state after send() resolved", {
         sessionId,
+        remainingQueueLength: session.queue.length,
       });
 
-      // Unblock any code awaiting session.streamReady (e.g. auto-greeting).
       session.resolveStreamReady();
 
       await this.processResponseStream(sessionId, response);
     } catch (err) {
       this.logger.error("Stream error", { sessionId, err });
 
-      // Unblock streamReady waiters so they don't hang indefinitely.
-      // rejectStreamReady is a no-op if the promise was already resolved.
+      // Unblock any streamReady waiters so they don't hang
       session.rejectStreamReady(err);
 
       this.dispatchEvent(sessionId, "error", {
@@ -169,13 +132,10 @@ export class BedrockStreamingService implements IStreamingService {
 
   enqueueSessionStart(sessionId: string): void {
     const session = this.requireSession(sessionId);
-
-    // Guard: Nova Sonic rejects duplicate sessionStart events on the same stream.
     if (session.isSessionStartSent) {
       this.logger.debug("enqueueSessionStart skipped — already sent", { sessionId });
       return;
     }
-
     this.enqueue(sessionId, {
       event: {
         sessionStart: { inferenceConfiguration: session.inferenceConfig },
@@ -354,6 +314,71 @@ export class BedrockStreamingService implements IStreamingService {
     });
   }
 
+  /**
+   * Enqueues a self-contained silent AUDIO block to satisfy Nova Sonic's
+   * requirement that every prompt contains at least one audio content block.
+   *
+   * Uses a private contentId so it never collides with the live-mic block
+   * (session.audioContentId) and does NOT set isAudioContentStartSent — the
+   * live mic block remains unaffected.
+   *
+   * Format: LPCM 16-bit 16 kHz mono — matches DefaultAudioInputConfiguration.
+   */
+  enqueueGreetingSilence(sessionId: string): void {
+    const session = this.requireSession(sessionId);
+
+    const greetingContentId = randomUUID();
+
+    // 1000 ms of silence @ 16 kHz / 16-bit / mono = 32 000 bytes of zeros
+    const SILENCE_MS       = 1000;
+    const SAMPLE_RATE      = 16_000;
+    const BYTES_PER_SAMPLE = 2;        // 16-bit
+    const CHANNELS         = 1;
+    const silenceBytes     = Math.ceil((SILENCE_MS / 1000) * SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS);
+    const silenceBase64    = Buffer.alloc(silenceBytes, 0).toString("base64");
+
+    // Open audio block — interactive:true so Nova treats it as a live user turn
+    this.enqueue(sessionId, {
+      event: {
+        contentStart: {
+          promptName:              session.promptName,
+          contentName:             greetingContentId,
+          type:                    "AUDIO",
+          interactive:             true,
+          role:                    "USER",
+          audioInputConfiguration: DefaultAudioInputConfiguration,
+        },
+      },
+    });
+
+    // Send the silence payload
+    this.enqueue(sessionId, {
+      event: {
+        audioInput: {
+          promptName:  session.promptName,
+          contentName: greetingContentId,
+          content:     silenceBase64,
+        },
+      },
+    });
+
+    // Close the audio block
+    this.enqueue(sessionId, {
+      event: {
+        contentEnd: {
+          promptName:  session.promptName,
+          contentName: greetingContentId,
+        },
+      },
+    });
+
+    this.logger.debug("Greeting silence enqueued", {
+      sessionId,
+      silenceMs: SILENCE_MS,
+      silenceBytes,
+    });
+  }
+
   async enqueueContentEnd(sessionId: string): Promise<void> {
     const session = this.requireSession(sessionId);
     this.enqueue(sessionId, {
@@ -460,9 +485,7 @@ export class BedrockStreamingService implements IStreamingService {
     }
 
     // Per-iterator flag so that return()/throw() only stop THIS iterator,
-    // not the entire session. Without this, the SDK calling return() on a
-    // finished stream would set session.isActive = false and kill the next
-    // stream's iterator too.
+    // not the entire session.
     let aborted = false;
 
     return {
@@ -497,6 +520,15 @@ export class BedrockStreamingService implements IStreamingService {
             }
 
             const nextEvent = session.queue.shift();
+
+            // ── DEBUG: log each event as it is sent to Bedrock ───────────────
+            const evKey = Object.keys((nextEvent as any)?.event ?? {})[0] ?? "unknown";
+            this.logger.debug("[DEBUG] Sending event to Bedrock", {
+              sessionId,
+              eventType: evKey,
+              remainingQueue: session.queue.length,
+            });
+
             return {
               value: {
                 chunk: {
@@ -529,12 +561,13 @@ export class BedrockStreamingService implements IStreamingService {
     sessionId: string,
     response: Awaited<
       ReturnType<BedrockRuntimeClient["send"]>
-    > & { body: AsyncIterable<any>; }
+    > & { body: AsyncIterable<any> }
   ): Promise<void> {
     const session = this.sessions.findById(sessionId);
     if (!session) return;
 
     const decoder = new TextDecoder();
+    let chunkCount = 0;
 
     try {
       for await (const event of (response as any).body) {
@@ -548,6 +581,36 @@ export class BedrockStreamingService implements IStreamingService {
         if (event.chunk?.bytes) {
           this.sessions.updateActivity(sessionId);
           const text = decoder.decode(event.chunk.bytes);
+          chunkCount++;
+
+          // ── DEBUG: log every raw event received from Bedrock ─────────────
+          try {
+            const parsed = JSON.parse(text);
+            const evKey = parsed?.event
+              ? Object.keys(parsed.event)[0]
+              : "non-event";
+            this.logger.info("[DEBUG] Bedrock → response event", {
+              sessionId,
+              chunkIndex: chunkCount,
+              eventType: evKey,
+              // Truncate audio payload but keep all other fields intact
+              event:
+                evKey === "audioOutput"
+                  ? {
+                      audioOutput: {
+                        contentName: parsed.event.audioOutput?.contentName,
+                        bytes: `<${(parsed.event.audioOutput?.content ?? "").length} base64-chars>`,
+                      },
+                    }
+                  : parsed?.event,
+            });
+          } catch {
+            this.logger.info("[DEBUG] Non-JSON chunk from Bedrock", {
+              sessionId,
+              text,
+            });
+          }
+
           this.handleResponseEvent(sessionId, session, text);
         } else if (event.modelStreamErrorException) {
           this.logger.error("Model stream error", {
@@ -570,10 +633,13 @@ export class BedrockStreamingService implements IStreamingService {
         }
       }
 
-      // Only dispatch streamComplete if the session is still active (natural end).
-      // If session.isActive is false, the session was force-closed by gracefulClose.
-      // In that case a new session may already exist under the same socketId in the
-      // repository — dispatching here would wrongly trigger the NEW session's handler.
+      // ── DEBUG: summary after response loop ends ──────────────────────────
+      this.logger.info("[DEBUG] Response loop ended", {
+        sessionId,
+        totalChunks: chunkCount,
+        isActive: session.isActive,
+      });
+
       if (session.isActive) {
         this.logger.info("Response stream complete", { sessionId });
         this.dispatchEvent(sessionId, "streamComplete", {
