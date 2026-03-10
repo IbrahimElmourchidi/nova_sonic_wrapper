@@ -10,6 +10,10 @@
     "lint": "eslint src/**/*.ts",
     "test": "jest",
     "connectAWS": "ssh -i nova_wrapper_key.pem ec2-user@13.61.2.209",
+    "startBackend": "pm2 start npm --name 'nova-wrapper' -- start",
+    "backEndStartup":"pm2 save && pm2 startup",
+    "stopBackend": "pm2 stop nova-wrapper",
+    "deleteBackend": "pm2 delete nova-wrapper",
     "showLogs": "pm2 logs nova-sonic --lines 100"
   },
   "dependencies": {
