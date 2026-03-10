@@ -14,6 +14,7 @@
     "backEndStartup":"pm2 save && pm2 startup",
     "stopBackend": "pm2 stop nova-wrapper",
     "deleteBackend": "pm2 delete nova-wrapper",
+    "deleteAllBackend": "pm2 delete all",
     "showLogs": "pm2 logs nova-sonic --lines 100"
   },
   "dependencies": {
