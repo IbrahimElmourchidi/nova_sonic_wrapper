@@ -29,13 +29,7 @@ import type {
 import type { EventHandler } from "../../domain/types";
 import type { SessionData } from "../../domain/entities/Session";
 
-// ── Default greeting text ──────────────────────────────────────────────────────
-//
-// Sent as a USER TEXT block alongside the pre-recorded audio greeting.
-// Nova Sonic will respond to whichever carries more semantic intent — in
-// practice it hears the audio and replies to that.
-// ─────────────────────────────────────────────────────────────────────────────
-const DEFAULT_GREETING_TEXT = "Hello, how are you today?";
+
 
 @injectable()
 export class SessionUseCase {
@@ -135,21 +129,33 @@ export class SessionUseCase {
   // ── Auto-greeting ─────────────────────────────────────────────────────────
 
   /**
-   * Pre-fills the session queue with the full greeting sequence so that when
+   * Pre-fills the session queue with the greeting sequence so that when
    * startStream() opens the HTTP/2 connection the SDK has data to transmit
    * immediately, preventing the send() deadlock.
    *
    * MUST be awaited BEFORE startStream().
    *
    * Sequence enqueued:
-   *   sessionStart → promptStart → systemPrompt (TEXT)
-   *     → userText (TEXT, optional fallback)
-   *     → audioGreeting (AUDIO, pre-recorded LPCM) ← satisfies Nova Sonic requirement
-   *     → promptEnd
+   *   sessionStart → promptStart → systemPrompt (SYSTEM TEXT)
+   *     → audioGreeting (USER AUDIO, interactive:true, pre-recorded LPCM)
+   *
+   * ── Why NO promptEnd ───────────────────────────────────────────────────────
+   * promptEnd closes the prompt from the client side and causes Nova Sonic to
+   * emit only usage accounting events (outputTokens: 0).  It does NOT trigger
+   * a spoken response.
+   *
+   * The correct pattern (mirroring normal Turn 2+) is:
+   *   contentStart(AUDIO, interactive:true) → audioInput → contentEnd
+   *   → [async iterable waits] → Nova Sonic generates audioOutput →
+   *   → response stream ends naturally → streamComplete fires.
+   *
+   * ── Why NO userText ────────────────────────────────────────────────────────
+   * Having an interactive:false USER TEXT block immediately before the
+   * interactive:true USER AUDIO block creates two conflicting user turns.
+   * The audio alone is sufficient to seed the queue and trigger the response.
    */
   async preEnqueueAutoGreeting(
     sessionId: string,
-    greetingText = DEFAULT_GREETING_TEXT,
     systemPrompt?: SystemPromptRequest
   ): Promise<void> {
     const session = this.requireActiveSession(sessionId);
@@ -164,22 +170,20 @@ export class SessionUseCase {
     this.streaming.enqueueSessionStart(sessionId);
     this.streaming.enqueuePromptStart(sessionId);
     this.setupSystemPrompt(sessionId, systemPrompt);
-    this.streaming.enqueueUserText(sessionId, greetingText);
 
-    // ── Audio block (required by Nova Sonic) ────────────────────────────────
-    // Every prompt must contain at least one AUDIO content block.
-    // We send the pre-recorded greeting (converted from MP3 at startup).
-    // interactive:false → Nova Sonic processes the full buffer without VAD.
+    // ── Audio greeting (USER AUDIO, interactive:true) ───────────────────────
+    // contentEnd sent immediately after the audio chunk acts as the explicit
+    // end-of-speech signal (same as VAD silence detection in live turns).
+    // Nova Sonic processes the audio and streams back an audioOutput response.
+    // The async iterable stays open waiting; streamComplete fires naturally
+    // when Nova Sonic finishes its response.
     this.streaming.enqueueAudioGreeting(
       sessionId,
       this.greetingAudio.getLpcmBuffer()
     );
 
-    void this.streaming.enqueuePromptEnd(sessionId);
-
     this.logger.info("Auto-greeting pre-enqueued (stream not started yet)", {
       sessionId,
-      greetingText,
     });
   }
 
