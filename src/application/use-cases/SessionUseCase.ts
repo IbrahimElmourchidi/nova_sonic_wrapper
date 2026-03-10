@@ -127,6 +127,33 @@ export class SessionUseCase {
     this.logger.debug("Audio start enqueued", { sessionId });
   }
 
+  // ── Auto-greeting ─────────────────────────────────────────────────────────
+
+  /**
+   * Fires the full session-start → prompt-start → system-prompt → user "hi"
+   * sequence so Nova Sonic produces an opening response without any user input.
+   *
+   * Must be called AFTER session.streamReady has resolved (i.e. the Bedrock
+   * bidirectional stream is open and accepting events).
+   *
+   * @param greetingText  Override the trigger phrase (default: "hi")
+   * @param systemPrompt  Override the system prompt for this session
+   */
+  sendAutoGreeting(
+    sessionId: string,
+    greetingText = "hi",
+    systemPrompt?: SystemPromptRequest
+  ): void {
+    this.requireActiveSession(sessionId);
+
+    this.streaming.enqueueSessionStart(sessionId);
+    this.streaming.enqueuePromptStart(sessionId);
+    this.setupSystemPrompt(sessionId, systemPrompt);
+    this.streaming.enqueueUserText(sessionId, greetingText);
+
+    this.logger.info("Auto-greeting enqueued", { sessionId, greetingText });
+  }
+
   // ── Audio streaming ───────────────────────────────────────────────────────
 
   streamAudio(sessionId: string, audioData: Buffer): void {

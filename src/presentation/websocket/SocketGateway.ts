@@ -120,10 +120,21 @@ export class SocketGateway {
 
       const session = this.sessionUseCase.createSession(request);
       this.audioStream.initQueue(session.sessionId);
+
+      // Register event handlers BEFORE starting the stream so no events are
+      // missed between stream open and handler registration.
       this.setupSessionEventHandlers(session.sessionId, socket);
 
       // Fire bidirectional stream – do NOT await
       this.sessionUseCase.startStream(session.sessionId);
+
+      // ── Auto-greeting ────────────────────────────────────────────────────
+      // Wait until the Bedrock stream is actually open before enqueuing events.
+      // Without this, events sent before the stream handshake completes are
+      // silently dropped and Nova never produces an opening response.
+      await session.streamReady;
+      this.sessionUseCase.sendAutoGreeting(session.sessionId);
+      // ─────────────────────────────────────────────────────────────────────
 
       ctx.state = SessionState.ACTIVE;
       callback?.({ success: true });
@@ -165,6 +176,12 @@ export class SocketGateway {
       this.audioStream.initQueue(session.sessionId);
       this.setupSessionEventHandlers(session.sessionId, socket);
       this.sessionUseCase.startStream(session.sessionId);
+
+      // ── Auto-greeting (same pattern as handleInitialize) ─────────────────
+      await session.streamReady;
+      this.sessionUseCase.sendAutoGreeting(session.sessionId);
+      // ─────────────────────────────────────────────────────────────────────
+
       ctx.state = SessionState.ACTIVE;
     } catch (err) {
       ctx.state = SessionState.CLOSED;
