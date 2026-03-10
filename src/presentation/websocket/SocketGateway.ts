@@ -133,21 +133,10 @@ export class SocketGateway {
       // Open the bidirectional HTTP/2 stream — do NOT await.
       this.sessionUseCase.startStream(session.sessionId);
 
-      // ── Send greeting audio into the LIVE stream ──────────────────────────
-      //
-      // CRITICAL: wait until send() has resolved (streamReady) before sending
-      // audio.  Pre-queued audio is processed by Nova Sonic as a batch dump
-      // before its real-time VAD/response engine is active → outputTokens:0
-      // and the stream hangs indefinitely.
-      //
-      // Sending audio AFTER streamReady mirrors exactly how Turn 2+ works:
-      // the HTTP/2 channel is open, Nova Sonic is in real-time mode, VAD
-      // fires when it detects end-of-speech (or when contentEnd arrives),
-      // and the model generates a spoken response.
-      const sessionData = this.sessionUseCase.getSession(session.sessionId);
-      await sessionData.streamReady;
-
-      await this.sessionUseCase.sendGreetingAudio(session.sessionId);
+      // Flutter will send the pre-recorded greeting automatically via the
+      // normal audioStart → audioInput → stopAudio pipeline after this ack.
+      // handleAudioStart waits for streamReady before emitting audioReady,
+      // so timing is handled there.
     } catch (err) {
       ctx.state = SessionState.CLOSED;
       this.logger.error("Failed to initialize session", {
