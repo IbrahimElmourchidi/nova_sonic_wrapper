@@ -196,6 +196,21 @@ export class SessionUseCase {
    */
   async sendGreetingAudio(sessionId: string): Promise<void> {
     this.requireActiveSession(sessionId);
+
+    // ── Log greeting file details right before streaming ─────────────────────
+    // These values confirm the file was found, converted, and has real content.
+    // If lpcmSizeKB is "0.0" or durationMs is 0, the MP3 is empty/corrupt.
+    // If greetingFilePath points to the wrong directory, process.cwd() is off.
+    const info = this.greetingAudio.getInfo();
+    this.logger.info("Sending greeting audio into stream", {
+      sessionId,
+      greetingFilePath: info.path,
+      lpcmSizeKB: info.lpcmSizeKB,
+      lpcmSizeBytes: info.lpcmSizeBytes,
+      durationMs: info.durationMs,
+    });
+    // ─────────────────────────────────────────────────────────────────────────
+
     await this.streaming.enqueueAudioGreeting(
       sessionId,
       this.greetingAudio.getLpcmBuffer()

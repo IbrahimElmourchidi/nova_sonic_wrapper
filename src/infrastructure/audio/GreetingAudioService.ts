@@ -114,4 +114,24 @@ export class GreetingAudioService {
     }
     return this.cachedLpcmBuffer;
   }
+
+  /**
+   * Returns key diagnostics about the cached greeting audio.
+   * Safe to call any time after initialize() has resolved.
+   * Used by SessionUseCase to log file details right before each send.
+   */
+  getInfo(): {
+    path: string;
+    lpcmSizeBytes: number;
+    lpcmSizeKB: string;
+    durationMs: number;
+  } {
+    const lpcmSizeBytes = this.cachedLpcmBuffer?.byteLength ?? 0;
+    return {
+      path: this.assetPath,
+      lpcmSizeBytes,
+      lpcmSizeKB: (lpcmSizeBytes / 1024).toFixed(1),
+      durationMs: Math.round((lpcmSizeBytes / 2 / 16_000) * 1000),
+    };
+  }
 }
