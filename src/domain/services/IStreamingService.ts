@@ -47,24 +47,6 @@ export interface IStreamingService {
   enqueueAudioChunk(sessionId: SessionId, audioData: Buffer): void;
 
   /**
-   * Synthesise greetingText via Amazon Polly and enqueue it as a complete
-   * audio content block to trigger a Nova Sonic greeting response.
-   */
-  enqueueGreetingAudio(sessionId: SessionId, greetingText: string): Promise<void>;
-
-  /**
-   * Enqueue a complete silent audio block to satisfy Nova Sonic's requirement
-   * that every prompt contains at least one audio content block.
-   *
-   * Emits: contentStart(AUDIO) → audioInput(silence) → contentEnd(AUDIO)
-   *
-   * Used exclusively by the auto-greeting sequence where no real microphone
-   * input exists yet.  The silence duration is controlled by
-   * GREETING_SILENCE_MS (default 300 ms).
-   */
-  enqueueGreetingSilence(sessionId: SessionId): void;
-
-  /**
    * Enqueue the content end event for audio.
    */
   enqueueContentEnd(sessionId: SessionId): Promise<void>;

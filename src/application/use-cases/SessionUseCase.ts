@@ -28,15 +28,15 @@ import type {
 import type { EventHandler } from "../../domain/types";
 import type { SessionData } from "../../domain/entities/Session";
 
-// ── Default greeting text ────────────────────────────────────────────────────
+// ── Default greeting ──────────────────────────────────────────────────────────
 //
-// "hi" (600 ms) is too short — Nova Sonic's ASR may not accumulate enough
-// speech energy to produce a reliable transcript and respond.
+// Nova Sonic responds to TEXT user messages immediately and reliably.
+// No audio, no Polly, no VAD edge cases needed.
 //
-// A full sentence gives Polly ~2 s of speech, which is long enough for Nova's
-// ASR to confidently transcribe and for the LLM to decide to respond.
-//
-// This text is cached by Polly on first call; subsequent sessions are instant.
+// Audio-based greeting history (for reference):
+//   interactive:true  + single Polly blob  → speechTokens:0   (VAD never fires)
+//   interactive:false + chunked Polly      → speechTokens:157, outputTokens:0
+//                                            (interactive:false = "don't respond")
 // ─────────────────────────────────────────────────────────────────────────────
 const DEFAULT_GREETING_TEXT = "Hello, how are you today?";
 
@@ -72,10 +72,6 @@ export class SessionUseCase {
     return session;
   }
 
-  /**
-   * Starts the bidirectional Bedrock stream. Fire-and-forget; promise is NOT
-   * awaited by the caller so the socket handler returns immediately.
-   */
   startStream(sessionId: string): void {
     this.streaming.initiateStream(sessionId).catch((err) => {
       this.logger.error("Stream terminated with error", { sessionId, err });
@@ -91,10 +87,6 @@ export class SessionUseCase {
     this.logger.debug("Session + prompt start enqueued", { sessionId });
   }
 
-  /**
-   * Starts a new prompt within an existing session.
-   * Sends sessionStart only on the first call; resets prompt-level state each time.
-   */
   startPrompt(sessionId: string): void {
     const session = this.requireActiveSession(sessionId);
 
@@ -102,14 +94,16 @@ export class SessionUseCase {
       this.streaming.enqueueSessionStart(sessionId);
     }
 
-    // Reset prompt-level state for the new turn
     session.promptName = randomUUID();
     session.audioContentId = randomUUID();
     session.isPromptStartSent = false;
     session.isAudioContentStartSent = false;
 
     this.streaming.enqueuePromptStart(sessionId);
-    this.logger.debug("Prompt started", { sessionId, firstTurn: !session.isSessionStartSent });
+    this.logger.debug("Prompt started", {
+      sessionId,
+      firstTurn: !session.isSessionStartSent,
+    });
   }
 
   setupSystemPrompt(
@@ -141,30 +135,14 @@ export class SessionUseCase {
   // ── Auto-greeting ─────────────────────────────────────────────────────────
 
   /**
-   * Synthesises the greeting via Polly then pre-fills the session queue with
-   * the full event sequence so that when startStream() opens the HTTP/2
-   * connection the SDK has data to transmit immediately.
+   * Pre-fills the session queue with a text-based greeting so that when
+   * startStream() opens the HTTP/2 connection the SDK has data to transmit
+   * immediately, preventing the send() deadlock.
    *
-   * MUST be awaited BEFORE startStream():
-   *   bedrockClient.send() blocks until Bedrock sends its first response.
-   *   Bedrock only responds after receiving sessionStart.
-   *   If the queue is empty when send() starts → deadlock.
-   *   Pre-filling the queue here breaks the cycle.
-   *
-   * Polly is called only once per unique greetingText; subsequent calls return
-   * the cached audio instantly.
+   * MUST be awaited BEFORE startStream().
    *
    * Sequence enqueued:
-   *   sessionStart → promptStart → systemPrompt →
-   *   greetingAudio(Polly LPCM, interactive:false, chunked) → userText → promptEnd
-   *
-   * Why interactive:false matters:
-   *   interactive:true = real-time VAD mode (for live mic streams).
-   *   interactive:false = pre-recorded mode (no VAD, Nova processes audio as-is).
-   *   Sending a pre-queued Polly blob with interactive:true causes speechTokens:0
-   *   because Nova's VAD never fires on a pre-packaged blob → no response.
-   *   With interactive:false, Nova's ASR processes the complete audio block
-   *   and the LLM generates a greeting response.
+   *   sessionStart → promptStart → systemPrompt → userText → promptEnd
    */
   async preEnqueueAutoGreeting(
     sessionId: string,
@@ -173,7 +151,6 @@ export class SessionUseCase {
   ): Promise<void> {
     const session = this.requireActiveSession(sessionId);
 
-    // Safety: bail out if the queue was already seeded.
     if (session.isSessionStartSent || session.isPromptStartSent) {
       this.logger.warn("preEnqueueAutoGreeting skipped — queue already seeded", {
         sessionId,
@@ -184,16 +161,7 @@ export class SessionUseCase {
     this.streaming.enqueueSessionStart(sessionId);
     this.streaming.enqueuePromptStart(sessionId);
     this.setupSystemPrompt(sessionId, systemPrompt);
-
-    // Polly audio (interactive:false, chunked) → Nova ASR transcribes the
-    // greeting → LLM generates and streams an audio response.
-    await this.streaming.enqueueGreetingAudio(sessionId, greetingText);
-
-    // Text hint: reinforces the transcript in case ASR confidence is marginal.
     this.streaming.enqueueUserText(sessionId, greetingText);
-
-    // promptEnd tells Nova to start generating. The actual queue push is
-    // synchronous; we call without awaiting the post-enqueue delay.
     void this.streaming.enqueuePromptEnd(sessionId);
 
     this.logger.info("Auto-greeting pre-enqueued (stream not started yet)", {
@@ -204,33 +172,25 @@ export class SessionUseCase {
 
   /**
    * Prepares the session for a new Bedrock stream after turnComplete.
-   *
-   * Each call to InvokeModelWithBidirectionalStreamCommand opens a brand-new
-   * HTTP/2 connection that needs its own sessionStart event. Without this,
-   * the turn-2+ queue is empty when send() starts, send() blocks waiting for
-   * Bedrock, Bedrock waits for sessionStart, sessionStart never arrives
-   * → deadlock → Flutter "cannot restart mic (timeout)".
+   * Resets all per-turn state and pre-enqueues sessionStart so send()
+   * has at least one event to transmit when the new HTTP/2 connection opens.
    *
    * Call this BEFORE startStream() in the streamComplete handler.
    */
   prepareNextStream(sessionId: string): void {
     const session = this.requireActiveSession(sessionId);
 
-    // Reset the flag so enqueueSessionStart will actually enqueue (not skip).
     session.isSessionStartSent = false;
-
-    // Reset prompt-level IDs for the fresh turn.
     session.promptName = randomUUID();
     session.audioContentId = randomUUID();
     session.isPromptStartSent = false;
     session.isAudioContentStartSent = false;
 
-    // Pre-enqueue sessionStart so the queue is non-empty when send() starts.
-    // The client will subsequently send promptStart → systemPrompt → audioStart
-    // which enqueues the rest.
     this.streaming.enqueueSessionStart(sessionId);
 
-    this.logger.debug("Next stream prepared — sessionStart pre-enqueued", { sessionId });
+    this.logger.debug("Next stream prepared — sessionStart pre-enqueued", {
+      sessionId,
+    });
   }
 
   // ── Audio streaming ───────────────────────────────────────────────────────
