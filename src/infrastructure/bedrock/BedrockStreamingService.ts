@@ -254,11 +254,13 @@ export class BedrockStreamingService implements IStreamingService {
   }
 
   /**
-   * Enqueues a short interactive TEXT user turn that reliably triggers Nova
-   * Sonic to generate a spoken response. MUST only be called after the
-   * required audio turn for the same prompt has already been enqueued,
-   * because Nova Sonic requires every prompt to contain at least one audio chunk.
+   * Enqueues a non-interactive TEXT user turn that triggers Nova Sonic to
+   * generate a spoken response on the subsequent promptEnd.
+   * interactive:false bypasses VAD so the model waits for promptEnd rather
+   * than using audio silence detection to decide the turn is over.
    *
+   * MUST only be called after the required audio content for the same prompt
+   * has already been enqueued (Nova Sonic requires at least one audio chunk).
    * Does NOT enqueue promptEnd — caller is responsible for that.
    */
   enqueueGreetingTrigger(sessionId: string, triggerText = "Hello!"): void {
@@ -271,7 +273,7 @@ export class BedrockStreamingService implements IStreamingService {
           promptName: session.promptName,
           contentName: contentId,
           type: "TEXT",
-          interactive: true,   // bypasses VAD — guarantees Nova Sonic responds
+          interactive: false,  // false = bypass VAD, respond on promptEnd
           role: "USER",
           textInputConfiguration: { mediaType: "text/plain" },
         },
@@ -337,13 +339,18 @@ export class BedrockStreamingService implements IStreamingService {
    * reliably trigger Nova Sonic's VAD. The model counted input speech tokens
    * but produced 0 output tokens — no audioOutput events, no response.
    *
-   * FIX (v3): Send ONLY an interactive TEXT trigger — no audio block at all.
-   * The silent audio block with interactive:false was causing Nova Sonic to
-   * treat the entire turn as "silent user" and suppress output, even though
-   * the TEXT block had interactive:true.
+   * FIX (v4): Keep the required silent audio block (interactive:false) but
+   * also set the TEXT trigger to interactive:false. Setting interactive:true
+   * on the text block enabled VAD, which saw the preceding silence and
+   * immediately decided "user is not speaking" → 0 output tokens.
+   * With interactive:false on both blocks, Nova Sonic waits for the
+   * explicit promptEnd to finalize the turn and generate a response.
    *
    * Event sequence:
-   *   → contentStart (TEXT, interactive:true, role:USER)   ← triggers response
+   *   → contentStart (AUDIO, interactive:false, role:USER)
+   *   → audioInput (100ms silence)
+   *   → contentEnd (AUDIO)
+   *   → contentStart (TEXT, interactive:false, role:USER)
    *   → textInput ("Hello! Please greet the user warmly.")
    *   → contentEnd (TEXT)
    *   → promptEnd
@@ -353,11 +360,62 @@ export class BedrockStreamingService implements IStreamingService {
   async enqueueAudioGreeting(sessionId: string, _audioData: Buffer): Promise<void> {
     const session = this.requireSession(sessionId);
 
-    // Interactive TEXT trigger only — no silent audio block.
+    // ── Step 1: Minimal silent AUDIO content (required by API) ────────────
+    const SILENT_CHUNK_BYTES = 3200; // 100ms at 16 kHz, 16-bit mono
+    const SILENT_CHUNK = Buffer.alloc(SILENT_CHUNK_BYTES);
+
+    const greetingContentId = randomUUID();
+
+    this.enqueue(sessionId, {
+      event: {
+        contentStart: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+          type: "AUDIO",
+          interactive: false,
+          role: "USER",
+          audioInputConfiguration: {
+            audioType: "SPEECH",
+            encoding: "base64",
+            mediaType: "audio/lpcm",
+            sampleRateHertz: 16000,
+            sampleSizeBits: 16,
+            channelCount: 1,
+          },
+        },
+      },
+    });
+
+    this.enqueue(sessionId, {
+      event: {
+        audioInput: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+          content: SILENT_CHUNK.toString("base64"),
+        },
+      },
+    });
+
+    this.enqueue(sessionId, {
+      event: {
+        contentEnd: {
+          promptName: session.promptName,
+          contentName: greetingContentId,
+        },
+      },
+    });
+
+    this.logger.debug("Greeting silent audio enqueued (100ms silence)", {
+      sessionId,
+      silentBytes: SILENT_CHUNK_BYTES,
+    });
+
+    // ── Step 2: Non-interactive TEXT trigger ───────────────────────────────
     this.enqueueGreetingTrigger(sessionId, "Hello! Please greet the user warmly.");
 
-    this.logger.debug("Greeting text trigger enqueued (no audio block)", { sessionId });
+    this.logger.debug("Greeting text trigger appended after silent audio", { sessionId });
 
+    // ── Step 3: promptEnd — close the user turn ───────────────────────────
     this.enqueue(sessionId, {
       event: { promptEnd: { promptName: session.promptName } },
     });
