@@ -125,29 +125,21 @@ export class SocketGateway {
       // missed between stream open and handler registration.
       this.setupSessionEventHandlers(session.sessionId, socket);
 
-      // Fire bidirectional stream – do NOT await
+      // ── Auto-greeting: pre-enqueue BEFORE startStream ──────────────────────
+      // bedrockClient.send() only resolves after Bedrock sends its first
+      // response event.  Bedrock only does that after receiving sessionStart.
+      // If the queue is empty when send() starts → send() blocks forever
+      // (deadlock).  Pre-filling the queue here breaks the cycle: the SDK
+      // drains sessionStart→promptStart→systemPrompt→userText→promptEnd the
+      // moment the HTTP/2 connection opens, Bedrock responds, send() resolves.
+      // ─────────────────────────────────────────────────────────────────────
+      this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
+
+      // Fire bidirectional stream — do NOT await.
       this.sessionUseCase.startStream(session.sessionId);
 
-      // Respond to the client immediately — do NOT await streamReady here.
-      // Awaiting it blocks the Socket.IO callback which the client uses to
-      // detect a successful connection; if the Bedrock handshake is slow (or
-      // fails before resolveStreamReady is called) the client times out.
       ctx.state = SessionState.ACTIVE;
       callback?.({ success: true });
-
-      // ── Auto-greeting (fire-and-forget) ──────────────────────────────────
-      // Wait for the HTTP/2 stream to be open, then send the greeting.
-      // sendAutoGreeting guards every step with isXxxSent flags, so it is safe
-      // even if the client has already sent promptStart by this point.
-      session.streamReady
-        .then(() => {
-          if (!this.sessionUseCase.isSessionActive(session.sessionId)) return;
-          return this.sessionUseCase.sendAutoGreeting(session.sessionId);
-        })
-        .catch((err) => {
-          this.logger.error("Auto-greeting failed", { socketId: socket.id, err });
-        });
-      // ─────────────────────────────────────────────────────────────────────
     } catch (err) {
       ctx.state = SessionState.CLOSED;
       this.logger.error("Failed to initialize session", {
@@ -182,24 +174,16 @@ export class SocketGateway {
         sessionId: socket.id,
       });
 
+      
       const session = this.sessionUseCase.createSession(request);
       this.audioStream.initQueue(session.sessionId);
       this.setupSessionEventHandlers(session.sessionId, socket);
-      this.sessionUseCase.startStream(session.sessionId);
-      ctx.state = SessionState.ACTIVE;
 
-      // ── Auto-greeting (fire-and-forget) ──────────────────────────────────
-      session.streamReady
-        .then(() => {
-          if (!this.sessionUseCase.isSessionActive(session.sessionId)) return;
-          return this.sessionUseCase.sendAutoGreeting(session.sessionId);
-        })
-        .catch((err) => {
-          this.logger.error("Auto-greeting failed after startNewChat", {
-            socketId: socket.id,
-            err,
-          });
-        });
+      // Same pre-enqueue pattern as handleInitialize (see comment above).
+      this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
+      this.sessionUseCase.startStream(session.sessionId);
+
+      ctx.state = SessionState.ACTIVE;
       // ─────────────────────────────────────────────────────────────────────
     } catch (err) {
       ctx.state = SessionState.CLOSED;

@@ -130,46 +130,55 @@ export class SessionUseCase {
   // ── Auto-greeting ─────────────────────────────────────────────────────────
 
   /**
-   * Fires the greeting sequence so Nova produces an opening response without
-   * waiting for user audio.
+   * Pre-fills the session queue with the full greeting event sequence so that
+   * when startStream() opens the Bedrock HTTP/2 connection the SDK immediately
+   * has events to send.
    *
-   * If the client has already sent promptStart (or opened an audio block) by
-   * the time streamReady resolves, we bail out — the client is driving the
-   * conversation and interleaving our events would cause Bedrock errors.
+   * MUST be called BEFORE startStream() — this is what breaks the deadlock:
    *
-   * Happy-path sequence: sessionStart → promptStart → systemPrompt →
-   *   userText("hi") → promptEnd.
+   *   bedrockClient.send() resolves only after Bedrock receives the first event.
+   *   Bedrock only gets events when the async-iterable queue is non-empty.
+   *   If we wait for streamReady before enqueuing (as we did before), the queue
+   *   is always empty when send() starts → send() blocks forever → deadlock.
+   *
+   * Sequence enqueued: sessionStart → promptStart → systemPrompt →
+   *   userText → contentEnd → promptEnd
+   *
+   * All enqueue* methods are synchronous (they just push to session.queue).
+   * The SDK drains the queue as soon as the connection is open.
    */
-  async sendAutoGreeting(
+  preEnqueueAutoGreeting(
     sessionId: string,
     greetingText = "hi",
     systemPrompt?: SystemPromptRequest
-  ): Promise<void> {
+  ): void {
     const session = this.requireActiveSession(sessionId);
 
-    // If the client already started a prompt it is driving the conversation.
-    // Injecting events would interleave with theirs (e.g. enqueueUserText
-    // closes any open audio block even if no audio was sent → Bedrock error).
-    if (session.isPromptStartSent) {
-      this.logger.info("Auto-greeting skipped — client already started prompt", {
+    // Safety: if something already put events in the queue, bail out.
+    if (session.isSessionStartSent || session.isPromptStartSent) {
+      this.logger.warn("preEnqueueAutoGreeting skipped — queue already seeded", {
         sessionId,
       });
       return;
     }
 
-    if (!session.isSessionStartSent) {
-      this.streaming.enqueueSessionStart(sessionId);
-    }
-
-    // At this point no audio block is open, so enqueueUserText is safe.
+    this.streaming.enqueueSessionStart(sessionId);
     this.streaming.enqueuePromptStart(sessionId);
     this.setupSystemPrompt(sessionId, systemPrompt);
+
+    // enqueueUserText: contentStart(TEXT) + textInput + contentEnd — all sync.
+    // No audio block is open at this point so the method is always safe.
     this.streaming.enqueueUserText(sessionId, greetingText);
 
-    // promptEnd tells Nova to start generating its response.
-    await this.streaming.enqueuePromptEnd(sessionId);
+    // promptEnd tells Nova to start generating. enqueuePromptEnd is declared
+    // async only because of a post-enqueue delay used during live turns; the
+    // actual queue push is synchronous so we call it without awaiting the delay.
+    void this.streaming.enqueuePromptEnd(sessionId);
 
-    this.logger.info("Auto-greeting enqueued", { sessionId, greetingText });
+    this.logger.info("Auto-greeting pre-enqueued (stream not started yet)", {
+      sessionId,
+      greetingText,
+    });
   }
 
 
