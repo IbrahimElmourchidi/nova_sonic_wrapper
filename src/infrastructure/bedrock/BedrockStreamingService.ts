@@ -305,7 +305,7 @@ export class BedrockStreamingService implements IStreamingService {
           promptName: session.promptName,
           contentName: greetingContentId,
           type: "AUDIO",
-          interactive: false,   // process whole buffer; do NOT run VAD
+          interactive: true,   
           role: "USER",
           audioInputConfiguration: {
             audioType: "SPEECH",
