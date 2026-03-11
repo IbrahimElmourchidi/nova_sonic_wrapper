@@ -10,6 +10,7 @@ import { NodeHttp2Handler } from "@smithy/node-http-handler";
 import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { execSync } from "node:child_process";
 import { firstValueFrom } from "rxjs";
 import { take } from "rxjs/operators";
 
@@ -28,9 +29,100 @@ import {
   WeatherToolSchema,
 } from "../config/defaults";
 
+// ── Clock skew constants ───────────────────────────────────────────────────────
+//
+// AWS SigV4 rejects signatures when the server clock is more than 5 minutes
+// (300 000 ms) ahead or behind AWS's time servers.  The AWS SDK has built-in
+// clock skew correction, but it only applies to smaller skews: once the
+// difference hits the hard limit the request is rejected even after the SDK's
+// correction pass (as evidenced by clockSkewCorrected:true in the error
+// metadata, alongside the 403 InvalidSignatureException).
+//
+// Strategy
+// ────────
+// 1. On the first InvalidSignatureException we attempt an in-process clock
+//    sync via `chronyc makestep` (recommended on AL2/AL2023/Ubuntu EC2) or
+//    `ntpdate` as a fallback.  This fixes the OS clock and is the permanent
+//    cure.
+//
+// 2. After syncing, we re-create the BedrockRuntimeClient from scratch.  The
+//    existing client instance caches a stale clock offset internally; a new
+//    instance re-measures the skew against the current (now-correct) OS time.
+//
+// 3. We retry the stream up to MAX_CLOCK_RETRIES times with an exponential
+//    back-off starting at CLOCK_RETRY_BASE_MS.  On a healthy server after an
+//    NTP sync this succeeds on the first retry.
+//
+// 4. We log a prominent warning on every clock-skew detection so the operator
+//    knows to investigate the root cause (EC2 clock drift, missing NTP daemon,
+//    hibernation/resume, etc.).
+
+const MAX_CLOCK_RETRIES   = 3;
+const CLOCK_RETRY_BASE_MS = 500; // 500 ms, 1 s, 2 s
+
+/** Returns true if the error is an AWS InvalidSignatureException caused by clock skew. */
+function isClockSkewError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as Record<string, unknown>;
+  return (
+    e["name"] === "InvalidSignatureException" &&
+    typeof e["message"] === "string" &&
+    (e["message"] as string).includes("Signature expired")
+  );
+}
+
+/**
+ * Attempts to synchronise the OS clock using chronyc or ntpdate.
+ * Swallows errors — if the sync tool is unavailable the retry will still run
+ * and the SDK's own clock-skew correction may be sufficient for small drifts.
+ */
+function tryNtpSync(logger: ILogger): void {
+  const cmds = [
+    "chronyc makestep",          // Amazon Linux 2, AL2023, Ubuntu 20+
+    "ntpdate -u pool.ntp.org",   // older Amazon Linux / Ubuntu
+    "w32tm /resync /force",      // Windows (not typical for Node servers)
+  ];
+
+  for (const cmd of cmds) {
+    try {
+      logger.warn(`[ClockSync] Running: ${cmd}`);
+      execSync(cmd, { timeout: 10_000, stdio: "pipe" });
+      logger.warn(`[ClockSync] Clock synchronised successfully via: ${cmd}`);
+      return;
+    } catch {
+      // command not found or permission denied — try the next one
+    }
+  }
+
+  logger.warn(
+    "[ClockSync] Could not sync clock automatically. " +
+    "Please run one of the following on the server and restart if the " +
+    "issue persists:\n" +
+    "  sudo chronyc makestep\n" +
+    "  sudo ntpdate -u pool.ntp.org\n" +
+    "  sudo systemctl restart chronyd\n" +
+    "  sudo systemctl restart systemd-timesyncd"
+  );
+}
+
+/** Builds a fresh BedrockRuntimeClient with a new HTTP/2 handler instance. */
+function buildBedrockClient(config: AppConfig): BedrockRuntimeClient {
+  const handler = new NodeHttp2Handler({
+    requestTimeout:         config.bedrock.requestTimeoutMs,
+    sessionTimeout:         config.bedrock.sessionTimeoutMs,
+    disableConcurrentStreams: false,
+    maxConcurrentStreams:   config.bedrock.maxConcurrentStreams,
+  });
+
+  return new BedrockRuntimeClient({
+    region:         config.aws.region,
+    requestHandler: handler,
+  });
+}
+
 @injectable()
 export class BedrockStreamingService implements IStreamingService {
-  private readonly bedrockClient: BedrockRuntimeClient;
+  private bedrockClient: BedrockRuntimeClient;
   private readonly sessionEventLog = new Map<string, unknown[]>();
 
   constructor(
@@ -46,22 +138,81 @@ export class BedrockStreamingService implements IStreamingService {
     @inject(TOKENS.Logger)
     private readonly logger: ILogger
   ) {
-    const handler = new NodeHttp2Handler({
-      requestTimeout: config.bedrock.requestTimeoutMs,
-      sessionTimeout: config.bedrock.sessionTimeoutMs,
-      disableConcurrentStreams: false,
-      maxConcurrentStreams: config.bedrock.maxConcurrentStreams,
-    });
-
-    this.bedrockClient = new BedrockRuntimeClient({
-      region: config.aws.region,
-      requestHandler: handler,
-    });
+    this.bedrockClient = buildBedrockClient(config);
   }
 
-  // ── IStreamingService ─────────────────────────────────────────────────────
+  // ── IStreamingService ──────────────────────────────────────────────────────
 
+  /**
+   * Initiates the bidirectional Bedrock stream for a session.
+   *
+   * Clock-skew resilience
+   * ─────────────────────
+   * If AWS returns InvalidSignatureException (clock skew ≥ 5 min) we:
+   *   1. Log a prominent warning with the exact clock skew from the error.
+   *   2. Attempt an OS-level NTP sync (chronyc makestep / ntpdate).
+   *   3. Re-create the BedrockRuntimeClient (clears the stale clock offset).
+   *   4. Retry with exponential back-off up to MAX_CLOCK_RETRIES times.
+   */
   async initiateStream(sessionId: string): Promise<void> {
+    const session = this.sessions.findById(sessionId);
+    if (!session) throw new SessionNotFoundError(sessionId);
+
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= MAX_CLOCK_RETRIES; attempt++) {
+      try {
+        await this._doInitiateStream(sessionId);
+        return; // success — exit retry loop
+      } catch (err) {
+        lastError = err;
+
+        if (!isClockSkewError(err)) {
+          // Not a clock-skew error — fail immediately, no retry.
+          throw err;
+        }
+
+        // ── Clock-skew recovery ──────────────────────────────────────────────
+        const msg = (err as Error).message ?? "";
+        this.logger.warn(
+          `[ClockSync] ⚠ AWS InvalidSignatureException (clock skew detected). ` +
+          `Attempt ${attempt + 1}/${MAX_CLOCK_RETRIES}. ` +
+          `Error: ${msg}`,
+          { sessionId }
+        );
+
+        if (attempt >= MAX_CLOCK_RETRIES) break; // exhausted retries
+
+        // Step 1: Sync the OS clock.
+        tryNtpSync(this.logger);
+
+        // Step 2: Re-create the Bedrock client so it picks up the corrected time.
+        this.logger.warn(
+          "[ClockSync] Re-creating BedrockRuntimeClient with fresh clock offset.",
+          { sessionId }
+        );
+        this.bedrockClient = buildBedrockClient(this.config);
+
+        // Step 3: Exponential back-off before retrying.
+        const delay = CLOCK_RETRY_BASE_MS * Math.pow(2, attempt);
+        this.logger.warn(`[ClockSync] Retrying in ${delay} ms...`, { sessionId });
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+
+    // All retries exhausted.
+    this.logger.error(
+      `[ClockSync] Stream failed after ${MAX_CLOCK_RETRIES} clock-skew retries. ` +
+      "Please sync the server clock manually and restart the process.\n" +
+      "  sudo chronyc makestep   (recommended on EC2)\n" +
+      "  sudo ntpdate -u pool.ntp.org",
+      { sessionId, err: lastError }
+    );
+    throw lastError;
+  }
+
+  /** Single stream attempt — extracted so the retry wrapper stays clean. */
+  private async _doInitiateStream(sessionId: string): Promise<void> {
     const session = this.sessions.findById(sessionId);
     if (!session) throw new SessionNotFoundError(sessionId);
 
@@ -128,14 +279,12 @@ export class BedrockStreamingService implements IStreamingService {
     session.isSessionStartSent = true;
   }
 
-    enqueuePromptStart(sessionId: string): void {
+  enqueuePromptStart(sessionId: string): void {
     const session = this.requireSession(sessionId);
 
-    // Build the audio output config dynamically so the voice chosen by the
-    // Flutter client at session-creation time is honoured.
     const audioOutputConfiguration = {
-      ...DefaultAudioOutputConfiguration,   // audioType, encoding, mediaType, sampleRate, etc.
-      voiceId: session.voiceId,             // overrides the hardcoded "tiffany" default
+      ...DefaultAudioOutputConfiguration,
+      voiceId: session.voiceId,
     };
 
     this.enqueue(sessionId, {
@@ -218,7 +367,6 @@ export class BedrockStreamingService implements IStreamingService {
   enqueueUserText(sessionId: string, content: string): void {
     const session = this.requireSession(sessionId);
 
-    // Close any open audio content block before sending text
     if (session.isAudioContentStartSent) {
       this.enqueue(sessionId, {
         event: {
@@ -264,16 +412,6 @@ export class BedrockStreamingService implements IStreamingService {
     });
   }
 
-  /**
-   * Enqueues a non-interactive TEXT user turn that triggers Nova Sonic to
-   * generate a spoken response on the subsequent promptEnd.
-   * interactive:false bypasses VAD so the model waits for promptEnd rather
-   * than using audio silence detection to decide the turn is over.
-   *
-   * MUST only be called after the required audio content for the same prompt
-   * has already been enqueued (Nova Sonic requires at least one audio chunk).
-   * Does NOT enqueue promptEnd — caller is responsible for that.
-   */
   enqueueGreetingTrigger(sessionId: string, triggerText = "Hello!"): void {
     const session = this.requireSession(sessionId);
     const contentId = randomUUID();
@@ -284,7 +422,7 @@ export class BedrockStreamingService implements IStreamingService {
           promptName: session.promptName,
           contentName: contentId,
           type: "TEXT",
-          interactive: false,  // false = bypass VAD, respond on promptEnd
+          interactive: false,
           role: "USER",
           textInputConfiguration: { mediaType: "text/plain" },
         },
@@ -342,41 +480,11 @@ export class BedrockStreamingService implements IStreamingService {
     });
   }
 
-  /**
-   * ── FIX: Redesigned greeting strategy ─────────────────────────────────────
-   *
-   * PROBLEM:
-   * Streaming 1.6s of pre-recorded greeting audio at real mic cadence did NOT
-   * reliably trigger Nova Sonic's VAD. The model counted input speech tokens
-   * but produced 0 output tokens — no audioOutput events, no response.
-   *
-   * FIX (v6): Open the audio content block exactly like the live mic path
-   * and stream the greeting audio into it — but do NOT send contentEnd or
-   * promptEnd. Let VAD handle end-of-speech detection naturally, just as
-   * it does for live mic audio on Turn 2+.
-   *
-   * Previous approaches (v1–v5) all closed the turn with promptEnd, and
-   * Bedrock consistently returned 0 output tokens regardless of the
-   * interactive flag or audio content. Nova Sonic requires an OPEN audio
-   * stream to engage its real-time response engine.
-   *
-   * The audio content block uses session.audioContentId so the client's
-   * subsequent mic audio continues in the same block seamlessly.
-   *
-   * Event sequence:
-   *   → contentStart (AUDIO, interactive:true, role:USER) — session.audioContentId
-   *   → audioInput × N chunks (~3200 bytes each, real greeting audio)
-   *   (content block left OPEN — client mic audio continues here)
-   *
-   * MUST be awaited.  MUST be called after session.streamReady resolves.
-   */
   async enqueueAudioGreeting(sessionId: string, audioData: Buffer): Promise<void> {
     const session = this.requireSession(sessionId);
 
-    const CHUNK_SIZE = 3200; // 100ms at 16 kHz, 16-bit mono
+    const CHUNK_SIZE = 3200;
 
-    // Open the audio content block — same contentId as the live mic path
-    // so the client's mic audio seamlessly continues in this block.
     this.enqueue(sessionId, {
       event: {
         contentStart: {
@@ -398,7 +506,6 @@ export class BedrockStreamingService implements IStreamingService {
     });
     session.isAudioContentStartSent = true;
 
-    // Send greeting audio in ~100ms chunks
     let chunkCount = 0;
     for (let offset = 0; offset < audioData.length; offset += CHUNK_SIZE) {
       const chunk = audioData.subarray(offset, offset + CHUNK_SIZE);
@@ -419,10 +526,6 @@ export class BedrockStreamingService implements IStreamingService {
       totalBytes: audioData.length,
       chunks: chunkCount,
     });
-
-    // NO contentEnd, NO text trigger, NO promptEnd.
-    // VAD will detect end-of-speech and trigger the model's response.
-    // Client mic audio continues in the same audio content block.
   }
 
   async enqueueContentEnd(sessionId: string): Promise<void> {
@@ -470,7 +573,7 @@ export class BedrockStreamingService implements IStreamingService {
     this.logger.info("Session ended", { sessionId });
   }
 
-  // ── Private helpers ───────────────────────────────────────────────────────
+  // ── Private helpers ────────────────────────────────────────────────────────
 
   private requireSession(sessionId: string): SessionData {
     const session = this.sessions.findById(sessionId);
@@ -515,16 +618,6 @@ export class BedrockStreamingService implements IStreamingService {
     return event;
   }
 
-  /**
-   * ── FIX: Reduced log noise for audioInput events ──────────────────────────
-   *
-   * Previously, every single audioInput chunk (~100ms of mic audio) produced
-   * a DEBUG log line. With 10 chunks/second, this created ~80 lines per 8s
-   * of speech — drowning out meaningful events.
-   *
-   * Now: audioInput events are sampled (logged every 50th chunk) with a
-   * running count. All other event types are still logged individually.
-   */
   private buildAsyncIterable(
     sessionId: string
   ): AsyncIterable<InvokeModelWithBidirectionalStreamInput> {
@@ -546,22 +639,27 @@ export class BedrockStreamingService implements IStreamingService {
           IteratorResult<InvokeModelWithBidirectionalStreamInput>
         > => {
           try {
-            // Loop until we have an item or must close.
-            // A stale queueSignal can wake us with an empty queue;
-            // we simply go back to waiting instead of returning done.
             while (true) {
-              if (aborted || !session.isActive || !this.sessions.has(sessionId)
-                  || session.streamGeneration !== myGeneration) {
+              if (
+                aborted ||
+                !session.isActive ||
+                !this.sessions.has(sessionId) ||
+                session.streamGeneration !== myGeneration
+              ) {
                 this.logger.debug("[DEBUG] Iterable returning done:true", {
                   sessionId,
-                  reason: aborted ? "aborted"
-                    : session.streamGeneration !== myGeneration ? "generation_changed"
-                    : !session.isActive ? "session_inactive" : "session_not_found",
+                  reason: aborted
+                    ? "aborted"
+                    : session.streamGeneration !== myGeneration
+                    ? "generation_changed"
+                    : !session.isActive
+                    ? "session_inactive"
+                    : "session_not_found",
                 });
                 return { value: undefined as any, done: true };
               }
 
-              if (session.queue.length > 0) break; // item available
+              if (session.queue.length > 0) break;
               try {
                 await Promise.race([
                   firstValueFrom(session.queueSignal.pipe(take(1))),
@@ -575,24 +673,28 @@ export class BedrockStreamingService implements IStreamingService {
                 if (isClose || aborted || !session.isActive) {
                   this.logger.debug("[DEBUG] Iterable returning done:true", {
                     sessionId,
-                    reason: isClose ? "closeSignal" : aborted ? "aborted" : "session_inactive",
+                    reason: isClose
+                      ? "closeSignal"
+                      : aborted
+                      ? "aborted"
+                      : "session_inactive",
                   });
                   return { value: undefined as any, done: true };
                 }
                 this.logger.error("Unexpected race error", { sessionId, err });
               }
-              // Loop back — re-check queue.length and termination conditions
             }
 
             const nextEvent = session.queue.shift();
             const evKey =
               Object.keys((nextEvent as any)?.event ?? {})[0] ?? "unknown";
 
-            // ── FIX: Sampled logging for audioInput ─────────────────────────
             if (evKey === "audioInput") {
               session.audioChunksSent = (session.audioChunksSent ?? 0) + 1;
-              // Log every 50th chunk, plus the 1st one
-              if (session.audioChunksSent === 1 || session.audioChunksSent % 50 === 0) {
+              if (
+                session.audioChunksSent === 1 ||
+                session.audioChunksSent % 50 === 0
+              ) {
                 this.logger.debug("[DEBUG] Sending audioInput to Bedrock", {
                   sessionId,
                   totalChunksSent: session.audioChunksSent,
@@ -634,13 +736,6 @@ export class BedrockStreamingService implements IStreamingService {
     };
   }
 
-  /**
-   * ── FIX: Enhanced response tracking ───────────────────────────────────────
-   *
-   * Now tracks whether audioOutput / textOutput events were received during
-   * the response stream. This makes it immediately obvious in logs when
-   * Nova Sonic produces 0 output tokens (the greeting bug).
-   */
   private async processResponseStream(
     sessionId: string,
     response: Awaited<ReturnType<BedrockRuntimeClient["send"]>> & {
@@ -671,7 +766,6 @@ export class BedrockStreamingService implements IStreamingService {
             const parsed = JSON.parse(text);
             const evKey = parsed?.event ? Object.keys(parsed.event)[0] : "non-event";
 
-            // Track output types for diagnostics
             if (evKey === "audioOutput") audioOutputCount++;
             if (evKey === "textOutput") textOutputCount++;
 
@@ -715,7 +809,6 @@ export class BedrockStreamingService implements IStreamingService {
         }
       }
 
-      // ── FIX: Enhanced end-of-stream diagnostics ───────────────────────────
       this.logger.info("[DEBUG] for-await loop exited", {
         sessionId,
         reason: session.isActive ? "bedrock_closed_stream" : "session_inactive",
@@ -723,16 +816,16 @@ export class BedrockStreamingService implements IStreamingService {
       });
 
       session.receivedAudioOutput = audioOutputCount > 0;
-      session.receivedTextOutput = textOutputCount > 0;
+      session.receivedTextOutput  = textOutputCount  > 0;
 
       this.logger.info("[DEBUG] Response loop ended", {
         sessionId,
-        totalChunks: chunkCount,
+        totalChunks:       chunkCount,
         audioOutputChunks: audioOutputCount,
-        textOutputChunks: textOutputCount,
-        hadAudioOutput: audioOutputCount > 0,
-        hadTextOutput: textOutputCount > 0,
-        isActive: session.isActive,
+        textOutputChunks:  textOutputCount,
+        hadAudioOutput:    audioOutputCount > 0,
+        hadTextOutput:     textOutputCount  > 0,
+        isActive:          session.isActive,
       });
 
       if (audioOutputCount === 0 && textOutputCount === 0 && chunkCount > 0) {
@@ -755,7 +848,7 @@ export class BedrockStreamingService implements IStreamingService {
     } catch (err) {
       this.logger.error("Error processing response stream", { sessionId, err });
       this.dispatchEvent(sessionId, "error", {
-        source: "responseStream",
+        source:  "responseStream",
         message: "Error processing response stream",
         details: err instanceof Error ? err.message : String(err),
       });
@@ -791,16 +884,16 @@ export class BedrockStreamingService implements IStreamingService {
       this.dispatchEvent(sessionId, "toolUse", ev.toolUse);
       const toolUse = ev.toolUse as Record<string, unknown>;
       session.toolUseContent = toolUse;
-      session.toolUseId = toolUse.toolUseId as string;
-      session.toolName = toolUse.toolName as string;
+      session.toolUseId      = toolUse.toolUseId as string;
+      session.toolName       = toolUse.toolName  as string;
     } else if (
       ev.contentEnd &&
       (ev.contentEnd as Record<string, unknown>).type === "TOOL"
     ) {
       this.dispatchEvent(sessionId, "toolEnd", {
         toolUseContent: session.toolUseContent,
-        toolUseId: session.toolUseId,
-        toolName: session.toolName,
+        toolUseId:      session.toolUseId,
+        toolName:       session.toolName,
       });
       this.toolService
         .execute(session.toolName, session.toolUseContent)
@@ -818,9 +911,9 @@ export class BedrockStreamingService implements IStreamingService {
             err,
           });
           this.dispatchEvent(sessionId, "error", {
-            source: "toolExecution",
+            source:   "toolExecution",
             toolName: session.toolName,
-            details: err instanceof Error ? err.message : String(err),
+            details:  err instanceof Error ? err.message : String(err),
           });
         });
     } else if (ev.contentEnd) {
@@ -843,18 +936,18 @@ export class BedrockStreamingService implements IStreamingService {
     const session = this.sessions.findById(sessionId);
     if (!session?.isActive) return;
 
-    const contentId = randomUUID();
+    const contentId    = randomUUID();
     const resultContent =
       typeof result === "string" ? result : JSON.stringify(result);
 
     this.enqueue(sessionId, {
       event: {
         contentStart: {
-          promptName: session.promptName,
+          promptName:  session.promptName,
           contentName: contentId,
           interactive: false,
-          type: "TOOL",
-          role: "TOOL",
+          type:        "TOOL",
+          role:        "TOOL",
           toolResultInputConfiguration: {
             toolUseId,
             type: "TEXT",
@@ -866,16 +959,16 @@ export class BedrockStreamingService implements IStreamingService {
     this.enqueue(sessionId, {
       event: {
         toolResult: {
-          promptName: session.promptName,
+          promptName:  session.promptName,
           contentName: contentId,
-          content: resultContent,
+          content:     resultContent,
         },
       },
     });
     this.enqueue(sessionId, {
       event: {
         contentEnd: {
-          promptName: session.promptName,
+          promptName:  session.promptName,
           contentName: contentId,
         },
       },
