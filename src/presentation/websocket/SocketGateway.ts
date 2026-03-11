@@ -11,7 +11,6 @@ import type { AppConfig } from "../../infrastructure/config/AppConfig";
 
 import {
   InitializeSessionRequestSchema,
-  SystemPromptRequestSchema,
   AudioStartSchema,
 } from "../../application/dtos/SessionDtos";
 import { DomainError } from "../../domain/errors";
@@ -228,10 +227,15 @@ export class SocketGateway {
   ): Promise<void> {
     try {
       this.requireState(socket.id, [SessionState.ACTIVE]);
-      const parsed = SystemPromptRequestSchema.parse(
-        typeof rawData === "string" ? { content: rawData } : rawData
+
+      // Ignore client-supplied prompt content — always use the server-side
+      // buildGermanTutorSystemPrompt() to guarantee English-first behaviour.
+      // Passing no request causes setupSystemPrompt to auto-build from topic.
+      this.logger.warn(
+        "Client sent systemPrompt event — ignored in favour of server-generated prompt",
+        { socketId: socket.id }
       );
-      this.sessionUseCase.setupSystemPrompt(socket.id, parsed);
+      this.sessionUseCase.setupSystemPrompt(socket.id);
     } catch (err) {
       this.logger.error("systemPrompt error", { socketId: socket.id, err });
       socket.emit("error", this.formatError(err));
