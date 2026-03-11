@@ -18,10 +18,10 @@ import { DomainError } from "../../domain/errors";
 import { resetStreamReady } from "../../domain/entities/Session";
 
 enum SessionState {
-  CLOSED = "closed",
+  CLOSED       = "closed",
   INITIALIZING = "initializing",
-  READY = "ready",
-  ACTIVE = "active",
+  READY        = "ready",
+  ACTIVE       = "active",
 }
 
 interface SocketContext {
@@ -68,10 +68,29 @@ export class SocketGateway {
   }
 
   private registerHandlers(socket: Socket, heartbeat: NodeJS.Timeout): void {
-    socket.on("initializeConnection", (callback) =>
-      this.handleInitialize(socket, callback)
-    );
-    socket.on("startNewChat", () => this.handleStartNewChat(socket));
+    // CHANGED: "initializeConnection" now accepts an optional payload as the
+    // first argument so Flutter can pass { topic, voiceId }.
+    //
+    // Socket.IO always puts the ack callback LAST.  Two valid call shapes:
+    //   Legacy: emit("initializeConnection", callback)
+    //   New:    emit("initializeConnection", { topic, voiceId }, callback)
+    //
+    // We detect which shape was used by checking whether args[0] is a function.
+    socket.on("initializeConnection", (...args: unknown[]) => {
+      const firstIsFunction = typeof args[0] === "function";
+      const rawData  = firstIsFunction ? {}   : (args[0] ?? {});
+      const callback = firstIsFunction ? (args[0] as (r: unknown) => void)
+                                       : (args[1] as ((r: unknown) => void) | undefined);
+      this.handleInitialize(socket, rawData, callback);
+    });
+
+    // CHANGED: startNewChat also accepts an optional payload for topic/voiceId.
+    socket.on("startNewChat", (...args: unknown[]) => {
+      const firstIsFunction = typeof args[0] === "function";
+      const rawData = firstIsFunction ? {} : (args[0] ?? {});
+      this.handleStartNewChat(socket, rawData);
+    });
+
     socket.on("promptStart", () => this.handlePromptStart(socket));
     socket.on("systemPrompt", (data: unknown) =>
       this.handleSystemPrompt(socket, data)
@@ -91,8 +110,11 @@ export class SocketGateway {
 
   // ── Handlers ─────────────────────────────────────────────────────────────
 
+  // CHANGED: accepts rawData and parses topic + voiceId from it before
+  // forwarding to sessionUseCase.createSession.
   private async handleInitialize(
     socket: Socket,
+    rawData: unknown,
     callback?: (result: unknown) => void
   ): Promise<void> {
     const ctx = this.getContext(socket.id);
@@ -113,30 +135,27 @@ export class SocketGateway {
     try {
       ctx.state = SessionState.INITIALIZING;
 
+      // Merge the socket ID plus any client-supplied topic / voiceId.
       const request = InitializeSessionRequestSchema.parse({
         sessionId: socket.id,
+        ...(rawData && typeof rawData === "object" ? rawData : {}),
       });
 
       const session = this.sessionUseCase.createSession(request);
       this.audioStream.initQueue(session.sessionId);
       this.setupSessionEventHandlers(session.sessionId, socket);
 
-      // Respond to the client immediately — don't wait for stream setup.
+      // Respond immediately — don't block on stream setup.
       ctx.state = SessionState.ACTIVE;
       callback?.({ success: true });
 
-      // Pre-queue ONLY: sessionStart + promptStart + systemPrompt.
-      // These are enough to unblock bedrockClient.send() — Bedrock returns
-      // a usageEvent for the system prompt tokens which resolves send().
+      // Pre-queue sessionStart + promptStart + German-tutor system prompt
+      // (auto-built from session.topic). Enough to unblock bedrockClient.send().
       await this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
 
-      // Open the bidirectional HTTP/2 stream — do NOT await.
+      // Open the bidirectional HTTP/2 stream — fire-and-forget.
       this.sessionUseCase.startStream(session.sessionId);
 
-      // Flutter will send the pre-recorded greeting automatically via the
-      // normal audioStart → audioInput → stopAudio pipeline after this ack.
-      // handleAudioStart waits for streamReady before emitting audioReady,
-      // so timing is handled there.
     } catch (err) {
       ctx.state = SessionState.CLOSED;
       this.logger.error("Failed to initialize session", {
@@ -151,7 +170,9 @@ export class SocketGateway {
     }
   }
 
-  private async handleStartNewChat(socket: Socket): Promise<void> {
+  // CHANGED: accepts rawData so that a fresh topic/voiceId can be passed when
+  // starting a new chat mid-session (same pattern as handleInitialize).
+  private async handleStartNewChat(socket: Socket, rawData?: unknown): Promise<void> {
     const ctx = this.getContext(socket.id);
     this.logger.info("startNewChat", { socketId: socket.id, state: ctx.state });
 
@@ -162,6 +183,7 @@ export class SocketGateway {
 
       const request = InitializeSessionRequestSchema.parse({
         sessionId: socket.id,
+        ...(rawData && typeof rawData === "object" ? rawData : {}),
       });
 
       const session = this.sessionUseCase.createSession(request);
@@ -171,7 +193,7 @@ export class SocketGateway {
       await this.sessionUseCase.preEnqueueAutoGreeting(session.sessionId);
       this.sessionUseCase.startStream(session.sessionId);
 
-      // Same pattern as handleInitialize: send greeting into live stream
+      // Same pattern as handleInitialize: send greeting into live stream.
       const sessionData = this.sessionUseCase.getSession(session.sessionId);
       await sessionData.streamReady;
       await this.sessionUseCase.sendGreetingAudio(session.sessionId);

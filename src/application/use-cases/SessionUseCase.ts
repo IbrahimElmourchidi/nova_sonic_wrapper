@@ -5,20 +5,21 @@ import { randomUUID } from "node:crypto";
 
 import { TOKENS } from "../../infrastructure/config/tokens";
 import type { ISessionRepository } from "../../domain/repositories/ISessionRepository";
-import type { IStreamingService } from "../../domain/services/IStreamingService";
-import type { ILogger } from "../../infrastructure/logging/ILogger";
-import { GreetingAudioService } from "../../infrastructure/audio/GreetingAudioService";
+import type { IStreamingService }   from "../../domain/services/IStreamingService";
+import type { ILogger }             from "../../infrastructure/logging/ILogger";
+import { GreetingAudioService }     from "../../infrastructure/audio/GreetingAudioService";
 
 import {
   SessionNotFoundError,
   SessionAlreadyExistsError,
   SessionInactiveError,
 } from "../../domain/errors";
+
 import {
   DefaultAudioInputConfiguration,
-  DefaultSystemPrompt,
   DefaultTextConfiguration,
   DefaultInferenceConfiguration,
+  buildGermanTutorSystemPrompt,
 } from "../../infrastructure/config/defaults";
 
 import type {
@@ -28,8 +29,6 @@ import type {
 } from "../dtos/SessionDtos";
 import type { EventHandler } from "../../domain/types";
 import type { SessionData } from "../../domain/entities/Session";
-
-
 
 @injectable()
 export class SessionUseCase {
@@ -61,8 +60,20 @@ export class SessionUseCase {
       ...request.inferenceConfig,
     };
 
-    const session = this.sessions.create(sessionId, inferenceConfig);
-    this.logger.info("Session created", { sessionId });
+    // Pass topic and voiceId so they are stored on the session entity for use
+    // when building the system prompt and the audio output configuration.
+    const session = this.sessions.create(
+      sessionId,
+      inferenceConfig,
+      request.topic,
+      request.voiceId
+    );
+
+    this.logger.info("Session created", {
+      sessionId,
+      topic:   session.topic,
+      voiceId: session.voiceId,
+    });
     return session;
   }
 
@@ -70,6 +81,25 @@ export class SessionUseCase {
     this.streaming.initiateStream(sessionId).catch((err) => {
       this.logger.error("Stream terminated with error", { sessionId, err });
     });
+  }
+
+  /**
+   * Prepares the session for the next stream turn (Turn 2+).
+   * Resets session-start tracking so a fresh sessionStart + promptStart are
+   * enqueued before the new HTTP/2 connection is opened by `startStream`.
+   */
+  prepareNextStream(sessionId: string): void {
+    const session = this.requireActiveSession(sessionId);
+
+    session.isSessionStartSent      = false;
+    session.promptName              = randomUUID();
+    session.audioContentId          = randomUUID();
+    session.isPromptStartSent       = false;
+    session.isAudioContentStartSent = false;
+
+    this.streaming.enqueueSessionStart(sessionId);
+    this.streaming.enqueuePromptStart(sessionId);
+    this.logger.debug("Next stream prepared (session + prompt start enqueued)", { sessionId });
   }
 
   // ── Session setup events (in order) ──────────────────────────────────────
@@ -88,26 +118,40 @@ export class SessionUseCase {
       this.streaming.enqueueSessionStart(sessionId);
     }
 
-    session.promptName = randomUUID();
-    session.audioContentId = randomUUID();
-    session.isPromptStartSent = false;
+    session.promptName              = randomUUID();
+    session.audioContentId          = randomUUID();
+    session.isPromptStartSent       = false;
     session.isAudioContentStartSent = false;
 
     this.streaming.enqueuePromptStart(sessionId);
-    this.logger.debug("Prompt started", {
-      sessionId,
-      firstTurn: !session.isSessionStartSent,
-    });
+    this.logger.debug("Prompt started", { sessionId });
   }
 
+  /**
+   * Enqueues a system prompt.
+   *
+   * If `request` is provided its `content` is used verbatim — this supports
+   * the legacy `socket.on("systemPrompt", …)` path.
+   *
+   * If `request` is omitted the prompt is auto-built from the session's
+   * stored `topic` using the professional German tutor template.  This is the
+   * path taken by `preEnqueueAutoGreeting`.
+   */
   setupSystemPrompt(
     sessionId: string,
-    request: SystemPromptRequest = { content: DefaultSystemPrompt }
+    request?: SystemPromptRequest
   ): void {
-    this.requireActiveSession(sessionId);
-    const textConfig = request.textConfig ?? DefaultTextConfiguration;
-    this.streaming.enqueueSystemPrompt(sessionId, request.content, textConfig);
-    this.logger.debug("System prompt enqueued", { sessionId });
+    const session    = this.requireActiveSession(sessionId);
+    const textConfig = request?.textConfig ?? DefaultTextConfiguration;
+
+    const content = request?.content ?? buildGermanTutorSystemPrompt(session.topic);
+
+    this.streaming.enqueueSystemPrompt(sessionId, content, textConfig);
+    this.logger.debug("System prompt enqueued", {
+      sessionId,
+      topic:        session.topic,
+      promptSource: request?.content ? "caller-provided" : "auto-generated",
+    });
   }
 
   sendUserText(sessionId: string, content: string): void {
@@ -119,18 +163,15 @@ export class SessionUseCase {
   setupAudioStart(sessionId: string, dto: AudioStartDto = {}): void {
     const session = this.requireActiveSession(sessionId);
 
-    // Skip if the greeting already opened the audio content block
     if (session.isAudioContentStartSent) {
-      this.logger.debug("Audio start skipped — content block already open (greeting)", {
-        sessionId,
-      });
+      this.logger.debug(
+        "Audio start skipped — content block already open (greeting)",
+        { sessionId }
+      );
       return;
     }
 
-    const audioConfig = {
-      ...DefaultAudioInputConfiguration,
-      ...dto.audioConfig,
-    };
+    const audioConfig = { ...DefaultAudioInputConfiguration, ...dto.audioConfig };
     this.streaming.enqueueAudioContentStart(sessionId, audioConfig);
     this.logger.debug("Audio start enqueued", { sessionId });
   }
@@ -138,15 +179,13 @@ export class SessionUseCase {
   // ── Auto-greeting ─────────────────────────────────────────────────────────
 
   /**
-   * Pre-fills the session queue with ONLY the session + system setup events
-   * needed to unblock bedrockClient.send().
+   * Pre-fills the session queue with: sessionStart → promptStart → systemPrompt.
+   * These three events are enough to unblock `bedrockClient.send()`.
    *
-   * MUST be awaited BEFORE startStream().
+   * The German tutor prompt is built automatically from `session.topic`.
+   * An explicit `systemPrompt` override is accepted for testing / admin use.
    *
-   * Sequence enqueued:
-   *   sessionStart → promptStart → systemPrompt (SYSTEM TEXT)
-   *
-   * The greeting itself is sent after streamReady in sendGreetingAudio().
+   * MUST be awaited BEFORE `startStream()`.
    */
   async preEnqueueAutoGreeting(
     sessionId: string,
@@ -163,33 +202,29 @@ export class SessionUseCase {
 
     this.streaming.enqueueSessionStart(sessionId);
     this.streaming.enqueuePromptStart(sessionId);
-    this.setupSystemPrompt(sessionId, systemPrompt);
+    this.setupSystemPrompt(sessionId, systemPrompt); // auto-builds from topic if no override
 
-    this.logger.info("Session + system prompt pre-enqueued (stream not started yet)", {
+    this.logger.info("Session + German-tutor system prompt pre-enqueued", {
       sessionId,
+      topic:   session.topic,
+      voiceId: session.voiceId,
     });
   }
 
   /**
-   * Sends the greeting into the LIVE bidirectional stream after streamReady.
-   *
-   * Sends a minimal silent audio chunk (satisfies Nova Sonic's "must include
-   * audio" API constraint) AND an interactive TEXT turn (bypasses VAD to
-   * guarantee a spoken response).
-   *
-   * MUST be awaited. MUST be called after session.streamReady has resolved.
+   * Sends the greeting audio into the live Bedrock stream.
+   * MUST be called after `session.streamReady` has resolved.
    */
   async sendGreetingAudio(sessionId: string): Promise<void> {
     this.requireActiveSession(sessionId);
 
-    // Log file diagnostics so audio issues are visible in logs
     const info = this.greetingAudio.getInfo();
-    this.logger.info("Sending greeting (silent audio + text trigger) into stream", {
+    this.logger.info("Sending greeting into stream", {
       sessionId,
       greetingFilePath: info.path,
-      lpcmSizeKB: info.lpcmSizeKB,
-      lpcmSizeBytes: info.lpcmSizeBytes,
-      durationMs: info.durationMs,
+      lpcmSizeKB:       info.lpcmSizeKB,
+      lpcmSizeBytes:    info.lpcmSizeBytes,
+      durationMs:       info.durationMs,
     });
 
     await this.streaming.enqueueAudioGreeting(
@@ -197,50 +232,15 @@ export class SessionUseCase {
       this.greetingAudio.getLpcmBuffer()
     );
 
-    this.logger.info("Greeting fully streamed into live stream", { sessionId });
+    this.logger.info("Greeting fully streamed", { sessionId });
   }
 
-  /**
-   * Prepares the session for a new Bedrock stream after turnComplete.
-   * Resets all per-turn state and pre-enqueues sessionStart so send()
-   * has at least one event to transmit when the new HTTP/2 connection opens.
-   *
-   * Call this BEFORE startStream() in the streamComplete handler.
-   */
-  prepareNextStream(sessionId: string): void {
-    const session = this.requireActiveSession(sessionId);
-
-    // Increment generation so the old stream's async iterable self-terminates
-    session.streamGeneration++;
-    // Drain any leftover events from the previous turn
-    session.queue.length = 0;
-
-    session.isSessionStartSent = false;
-    session.promptName = randomUUID();
-    session.audioContentId = randomUUID();
-    session.isPromptStartSent = false;
-    session.isAudioContentStartSent = false;
-
-    // Reset per-turn response tracking counters
-    session.audioChunksSent = 0;
-    session.receivedAudioOutput = false;
-    session.receivedTextOutput = false;
-
-    this.streaming.enqueueSessionStart(sessionId);
-
-    this.logger.debug("Next stream prepared — sessionStart pre-enqueued", {
-      sessionId,
-    });
-  }
-
-  // ── Audio streaming ───────────────────────────────────────────────────────
+  // ── Continued from original (unchanged methods kept for completeness) ────
 
   streamAudio(sessionId: string, audioData: Buffer): void {
     this.requireActiveSession(sessionId);
     this.streaming.enqueueAudioChunk(sessionId, audioData);
   }
-
-  // ── Teardown sequence ─────────────────────────────────────────────────────
 
   async endAudioContent(sessionId: string): Promise<void> {
     const session = this.sessions.findById(sessionId);
@@ -266,15 +266,12 @@ export class SessionUseCase {
   forceCloseSession(sessionId: string): void {
     const session = this.sessions.findById(sessionId);
     if (!session) return;
-
     session.isActive = false;
     session.closeSignal.next();
     session.closeSignal.complete();
     this.sessions.delete(sessionId);
     this.logger.warn("Session force-closed", { sessionId });
   }
-
-  // ── Event handlers ────────────────────────────────────────────────────────
 
   registerEventHandler(
     sessionId: string,
@@ -285,8 +282,6 @@ export class SessionUseCase {
     if (!session) throw new SessionNotFoundError(sessionId);
     session.responseHandlers.set(eventType, handler as (data: unknown) => void);
   }
-
-  // ── Queries ───────────────────────────────────────────────────────────────
 
   getSession(sessionId: string): SessionData {
     return this.requireActiveSession(sessionId);
@@ -308,15 +303,10 @@ export class SessionUseCase {
   cleanupIdleSessions(idleThresholdMs: number): void {
     const idle = this.sessions.getIdleSessionIds(idleThresholdMs);
     idle.forEach((sessionId) => {
-      this.logger.warn("Force-closing idle session", {
-        sessionId,
-        idleThresholdMs,
-      });
+      this.logger.warn("Force-closing idle session", { sessionId, idleThresholdMs });
       this.forceCloseSession(sessionId);
     });
   }
-
-  // ── Helpers ───────────────────────────────────────────────────────────────
 
   private requireActiveSession(sessionId: string): SessionData {
     const session = this.sessions.findById(sessionId);

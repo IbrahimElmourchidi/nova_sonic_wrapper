@@ -3,7 +3,11 @@ import "reflect-metadata";
 import { injectable } from "tsyringe";
 
 import type { ISessionRepository } from "../../domain/repositories/ISessionRepository";
-import { createSessionData, type SessionData, type SessionId } from "../../domain/entities/Session";
+import {
+  createSessionData,
+  type SessionData,
+  type SessionId,
+} from "../../domain/entities/Session";
 import { SessionAlreadyExistsError } from "../../domain/errors";
 import type { InferenceConfig } from "../../domain/types";
 
@@ -11,11 +15,16 @@ import type { InferenceConfig } from "../../domain/types";
 export class InMemorySessionRepository implements ISessionRepository {
   private readonly store = new Map<SessionId, SessionData>();
 
-  create(sessionId: SessionId, inferenceConfig: InferenceConfig): SessionData {
+  create(
+    sessionId: SessionId,
+    inferenceConfig: InferenceConfig,
+    topic?: string,
+    voiceId?: string
+  ): SessionData {
     if (this.store.has(sessionId)) {
       throw new SessionAlreadyExistsError(sessionId);
     }
-    const session = createSessionData(sessionId, inferenceConfig);
+    const session = createSessionData(sessionId, inferenceConfig, topic, voiceId);
     this.store.set(sessionId, session);
     return session;
   }
@@ -38,18 +47,14 @@ export class InMemorySessionRepository implements ISessionRepository {
 
   updateActivity(sessionId: SessionId): void {
     const session = this.store.get(sessionId);
-    if (session) {
-      session.lastActivity = Date.now();
-    }
+    if (session) session.lastActivity = Date.now();
   }
 
   getIdleSessionIds(idleThresholdMs: number): SessionId[] {
     const now = Date.now();
     const idle: SessionId[] = [];
     for (const [id, session] of this.store) {
-      if (now - session.lastActivity > idleThresholdMs) {
-        idle.push(id);
-      }
+      if (now - session.lastActivity > idleThresholdMs) idle.push(id);
     }
     return idle;
   }

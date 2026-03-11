@@ -7,14 +7,10 @@ export type SessionId = string;
 
 export enum SessionStatus {
   INITIALIZING = "initializing",
-  READY = "ready",
-  ACTIVE = "active",
-  CLOSING = "closing",
-  CLOSED = "closed",
-}
-
-export interface AudioContentId extends String {
-  readonly _brand: "AudioContentId";
+  READY        = "ready",
+  ACTIVE       = "active",
+  CLOSING      = "closing",
+  CLOSED       = "closed",
 }
 
 export interface SessionData {
@@ -37,70 +33,70 @@ export interface SessionData {
   status: SessionStatus;
   streamReady: Promise<void>;
   resolveStreamReady: () => void;
-  /** Rejects streamReady — called by the streaming service on fatal stream error. */
   rejectStreamReady: (err: unknown) => void;
 
-  // ── Per-turn response tracking (FIX: helps diagnose zero-output issues) ──
+  // Per-turn response tracking
   audioChunksSent: number;
   receivedAudioOutput: boolean;
   receivedTextOutput: boolean;
 
-  /** Incremented each time a new stream starts. Old iterators detect the
-   *  mismatch and self-terminate so they don't compete with the new one. */
+  /** Incremented each time a new stream starts so stale iterators self-terminate. */
   streamGeneration: number;
+
+  // ── German tutor metadata ─────────────────────────────────────────────────
+  /** Healthcare sub-topic for the lesson (e.g. "General Health"). */
+  topic: string;
+  /** Nova Sonic voice ID used for audio output (e.g. "tiffany", "matthew"). */
+  voiceId: string;
 }
 
-/**
- * Resets the streamReady promise for a new Bedrock stream (called between turns).
- * The new promise is both resolvable and rejectable so callers never hang.
- */
 export function resetStreamReady(session: SessionData): void {
   let resolve!: () => void;
-  let reject!: (err: unknown) => void;
-  session.streamReady = new Promise<void>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
+  let reject!:  (err: unknown) => void;
+  session.streamReady        = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
   session.resolveStreamReady = resolve;
-  session.rejectStreamReady = reject;
+  session.rejectStreamReady  = reject;
 }
 
 export function createSessionData(
   sessionId: SessionId,
-  inferenceConfig: InferenceConfig
+  inferenceConfig: InferenceConfig,
+  topic   = "General Health",
+  voiceId = "tiffany"
 ): SessionData {
   let resolveStreamReady!: () => void;
-  let rejectStreamReady!: (err: unknown) => void;
+  let rejectStreamReady!:  (err: unknown) => void;
   const streamReady = new Promise<void>((resolve, reject) => {
     resolveStreamReady = resolve;
-    rejectStreamReady = reject;
+    rejectStreamReady  = reject;
   });
 
   return {
     sessionId,
-    promptName: randomUUID(),
-    audioContentId: randomUUID(),
+    promptName:            randomUUID(),
+    audioContentId:        randomUUID(),
     inferenceConfig,
-    queue: [],
-    queueSignal: new Subject<void>(),
-    closeSignal: new Subject<void>(),
-    responseHandlers: new Map(),
-    toolUseContent: null,
-    toolUseId: "",
-    toolName: "",
-    isActive: true,
-    isSessionStartSent: false,
-    isPromptStartSent: false,
+    queue:                 [],
+    queueSignal:           new Subject<void>(),
+    closeSignal:           new Subject<void>(),
+    responseHandlers:      new Map(),
+    toolUseContent:        null,
+    toolUseId:             "",
+    toolName:              "",
+    isActive:              true,
+    isSessionStartSent:    false,
+    isPromptStartSent:     false,
     isAudioContentStartSent: false,
-    lastActivity: Date.now(),
-    status: SessionStatus.INITIALIZING,
+    lastActivity:          Date.now(),
+    status:                SessionStatus.INITIALIZING,
     streamReady,
     resolveStreamReady,
     rejectStreamReady,
-    // Per-turn tracking
-    audioChunksSent: 0,
-    receivedAudioOutput: false,
-    receivedTextOutput: false,
-    streamGeneration: 0,
+    audioChunksSent:       0,
+    receivedAudioOutput:   false,
+    receivedTextOutput:    false,
+    streamGeneration:      0,
+    topic,
+    voiceId,
   };
 }

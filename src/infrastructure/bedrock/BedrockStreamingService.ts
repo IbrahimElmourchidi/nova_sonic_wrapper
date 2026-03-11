@@ -128,27 +128,35 @@ export class BedrockStreamingService implements IStreamingService {
     session.isSessionStartSent = true;
   }
 
-  enqueuePromptStart(sessionId: string): void {
+    enqueuePromptStart(sessionId: string): void {
     const session = this.requireSession(sessionId);
+
+    // Build the audio output config dynamically so the voice chosen by the
+    // Flutter client at session-creation time is honoured.
+    const audioOutputConfiguration = {
+      ...DefaultAudioOutputConfiguration,   // audioType, encoding, mediaType, sampleRate, etc.
+      voiceId: session.voiceId,             // overrides the hardcoded "tiffany" default
+    };
+
     this.enqueue(sessionId, {
       event: {
         promptStart: {
           promptName: session.promptName,
-          textOutputConfiguration: { mediaType: "text/plain" },
-          audioOutputConfiguration: DefaultAudioOutputConfiguration,
+          textOutputConfiguration:    { mediaType: "text/plain" },
+          audioOutputConfiguration,
           toolUseOutputConfiguration: { mediaType: "application/json" },
           toolConfiguration: {
             tools: [
               {
                 toolSpec: {
-                  name: "getDateAndTimeTool",
+                  name:        "getDateAndTimeTool",
                   description: "Get information about the current date and time.",
                   inputSchema: { json: DefaultToolSchema },
                 },
               },
               {
                 toolSpec: {
-                  name: "getWeatherTool",
+                  name:        "getWeatherTool",
                   description:
                     "Get the current weather for a given location, based on its WGS84 coordinates.",
                   inputSchema: { json: WeatherToolSchema },
@@ -160,7 +168,10 @@ export class BedrockStreamingService implements IStreamingService {
       },
     });
     session.isPromptStartSent = true;
-    this.logger.debug("Prompt start enqueued", { sessionId });
+    this.logger.debug("Prompt start enqueued", {
+      sessionId,
+      voiceId: session.voiceId,
+    });
   }
 
   enqueueSystemPrompt(
