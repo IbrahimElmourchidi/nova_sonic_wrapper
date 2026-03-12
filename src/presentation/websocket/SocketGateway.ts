@@ -316,22 +316,43 @@ export class SocketGateway {
 
   private async handleStopAudio(socket: Socket): Promise<void> {
     const ctx = this.getContext(socket.id);
-
+ 
     if (
       !this.sessionUseCase.isSessionActive(socket.id) ||
       ctx.cleanupInProgress
     ) {
       this.logger.debug(
-        "stopAudio: no active session or cleanup in progress",
+        "stopAudio: no active session or cleanup in progress — skipping",
         { socketId: socket.id }
       );
       return;
     }
-
+ 
     try {
       ctx.cleanupInProgress = true;
-      await this.gracefulClose(socket.id);
-      ctx.state = SessionState.CLOSED;
+ 
+      // ── FIX ─────────────────────────────────────────────────────────────────
+      //
+      // OLD (broken):
+      //   await this.gracefulClose(socket.id);   ← calls closeSession() which
+      //   ctx.state = SessionState.CLOSED;          destroys the session entity
+      //
+      // NEW (correct):
+      //   Only enqueue contentEnd + promptEnd to tell Bedrock "user audio is
+      //   done — please respond now."  The session entity stays alive so that
+      //   processResponseStream() can read the AI response and dispatch
+      //   streamComplete → turnComplete → Flutter mic restart.
+      //
+      //   Session teardown (closeSession / gracefulClose) is reserved for
+      //   handleDisconnect when the Flutter client truly leaves.
+      // ────────────────────────────────────────────────────────────────────────
+      await this.sessionUseCase.endAudioContent(socket.id);
+      await this.sessionUseCase.endPrompt(socket.id);
+ 
+      // ctx.state intentionally NOT changed — session remains ACTIVE so that
+      // the subsequent promptStart and audioStart events for the next turn
+      // pass the requireState([ACTIVE, READY]) guard in their handlers.
+ 
     } catch (err) {
       this.logger.error("stopAudio error", { socketId: socket.id, err });
       socket.emit("error", this.formatError(err));
