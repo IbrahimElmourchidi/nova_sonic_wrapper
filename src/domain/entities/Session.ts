@@ -43,6 +43,16 @@ export interface SessionData {
   /** Incremented each time a new stream starts so stale iterators self-terminate. */
   streamGeneration: number;
 
+  /**
+   * Set to true by prepareNextStream() so that startPrompt() knows the
+   * sessionStart + promptStart have already been enqueued for this turn
+   * and should not be re-sent.
+   */
+  nextStreamPrepared: boolean;
+
+  /** True once a system prompt has been enqueued for the current prompt turn. */
+  isSystemPromptSent: boolean;
+
   // ── German tutor metadata ─────────────────────────────────────────────────
   /** Healthcare sub-topic for the lesson (e.g. "General Health"). */
   topic: string;
@@ -96,6 +106,8 @@ export function createSessionData(
     receivedAudioOutput:   false,
     receivedTextOutput:    false,
     streamGeneration:      0,
+    nextStreamPrepared:    false,
+    isSystemPromptSent:    false,
     topic,
     voiceId,
   };

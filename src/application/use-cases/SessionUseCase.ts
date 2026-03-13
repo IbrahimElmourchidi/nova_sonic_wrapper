@@ -97,9 +97,11 @@ export class SessionUseCase {
     session.audioContentId          = randomUUID();
     session.isPromptStartSent       = false;
     session.isAudioContentStartSent = false;
+    session.isSystemPromptSent      = false;
 
     this.streaming.enqueueSessionStart(sessionId);
     this.streaming.enqueuePromptStart(sessionId);
+    session.nextStreamPrepared = true;
     this.logger.debug("Next stream prepared (session + prompt start enqueued)", { sessionId });
   }
 
@@ -115,6 +117,15 @@ export class SessionUseCase {
   startPrompt(sessionId: string): void {
     const session = this.requireActiveSession(sessionId);
 
+    if (session.nextStreamPrepared) {
+      // prepareNextStream() already sent sessionStart + promptStart for this
+      // turn. Only enqueue the system prompt; skip re-sending the others.
+      session.nextStreamPrepared = false;
+      this.setupSystemPrompt(sessionId);
+      this.logger.debug("Prompt started (system prompt enqueued; session+prompt start already prepared)", { sessionId });
+      return;
+    }
+
     if (!session.isSessionStartSent) {
       this.streaming.enqueueSessionStart(sessionId);
     }
@@ -123,6 +134,7 @@ export class SessionUseCase {
     session.audioContentId          = randomUUID();
     session.isPromptStartSent       = false;
     session.isAudioContentStartSent = false;
+    session.isSystemPromptSent      = false;
 
     this.streaming.enqueuePromptStart(sessionId);
     this.logger.debug("Prompt started", { sessionId });
@@ -142,12 +154,18 @@ export class SessionUseCase {
     sessionId: string,
     request?: SystemPromptRequest
   ): void {
-    const session    = this.requireActiveSession(sessionId);
-    const textConfig = request?.textConfig ?? DefaultTextConfiguration;
+    const session = this.requireActiveSession(sessionId);
 
+    if (session.isSystemPromptSent) {
+      this.logger.debug("setupSystemPrompt skipped — already enqueued for this turn", { sessionId });
+      return;
+    }
+
+    const textConfig = request?.textConfig ?? DefaultTextConfiguration;
     const content = request?.content ?? buildGermanTutorSystemPrompt(session.topic);
 
     this.streaming.enqueueSystemPrompt(sessionId, content, textConfig);
+    session.isSystemPromptSent = true;
     this.logger.debug("System prompt enqueued", {
       sessionId,
       topic:        session.topic,
