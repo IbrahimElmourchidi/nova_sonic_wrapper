@@ -95,7 +95,7 @@ export class AudioStreamUseCase {
         queue.isProcessing = false;
 
         // Schedule next batch if needed
-        if (queue.chunks.length > 0 && queue.isActive) {
+        if (queue.chunks.length > 0 && queue.isActive && this.queues.has(sessionId)) {
           setImmediate(() => this.processQueue(sessionId));
         }
       }
@@ -103,8 +103,14 @@ export class AudioStreamUseCase {
 
     // Run async without blocking caller
     processBatch().catch((err) => {
-      this.logger.error("Error processing audio queue", { sessionId, err });
-      queue.isProcessing = false;
+      const code = (err as { code?: string })?.code;
+      if (code === "SESSION_NOT_FOUND" || code === "SESSION_INACTIVE") {
+        // Session is gone — destroy the queue to stop further retries.
+        this.destroyQueue(sessionId);
+      } else {
+        this.logger.error("Error processing audio queue", { sessionId, err });
+        queue.isProcessing = false;
+      }
     });
   }
 }

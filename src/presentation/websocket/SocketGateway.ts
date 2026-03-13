@@ -437,10 +437,11 @@ export class SocketGateway {
         // open are buffered safely in session.queue.
         // ──────────────────────────────────────────────────────────────────
         resetStreamReady(session);
-        session.resolveStreamReady(); // ← breaks the Turn 2+ deadlock
 
         this.sessionUseCase.prepareNextStream(sessionId);
         this.sessionUseCase.startStream(sessionId);
+
+        session.resolveStreamReady(); // ← breaks the Turn 2+ deadlock (after queue is seeded)
 
         socket.emit("turnComplete");
       }

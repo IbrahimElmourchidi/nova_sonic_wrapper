@@ -91,6 +91,7 @@ export class SessionUseCase {
   prepareNextStream(sessionId: string): void {
     const session = this.requireActiveSession(sessionId);
 
+    session.streamGeneration       += 1;
     session.isSessionStartSent      = false;
     session.promptName              = randomUUID();
     session.audioContentId          = randomUUID();
