@@ -217,7 +217,8 @@ export class BedrockStreamingService implements IStreamingService {
     if (!session) throw new SessionNotFoundError(sessionId);
 
     try {
-      this.logger.info("Initiating bidirectional stream", { sessionId });
+      const activeSessions = this.sessions.getAllIds().length;
+      this.logger.info("Initiating bidirectional stream", { sessionId, activeSessions });
 
       this.logger.info("[DEBUG] Queue snapshot before send()", {
         sessionId,
@@ -410,6 +411,7 @@ export class BedrockStreamingService implements IStreamingService {
         },
       },
     });
+    this.logger.info("[TRANSCRIPT] User (text)", { sessionId, text: content });
   }
 
   enqueueGreetingTrigger(sessionId: string, triggerText = "Hello!"): void {
@@ -884,6 +886,12 @@ export class BedrockStreamingService implements IStreamingService {
     if (ev.contentStart) {
       this.dispatchEvent(sessionId, "contentStart", ev.contentStart);
     } else if (ev.textOutput) {
+      const textOut = ev.textOutput as Record<string, unknown>;
+      this.logger.info("[TRANSCRIPT] Assistant", {
+        sessionId,
+        role: textOut.role ?? "ASSISTANT",
+        text: textOut.content,
+      });
       this.dispatchEvent(sessionId, "textOutput", ev.textOutput);
     } else if (ev.audioOutput) {
       this.dispatchEvent(sessionId, "audioOutput", ev.audioOutput);
