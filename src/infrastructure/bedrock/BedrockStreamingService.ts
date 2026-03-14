@@ -275,7 +275,12 @@ export class BedrockStreamingService implements IStreamingService {
       return;
     }
     this.enqueue(sessionId, {
-      event: { sessionStart: { inferenceConfiguration: session.inferenceConfig } },
+      event: {
+        sessionStart: {
+          sessionId:             session.bedrockSessionId,
+          inferenceConfiguration: session.inferenceConfig,
+        },
+      },
     });
     session.isSessionStartSent = true;
   }

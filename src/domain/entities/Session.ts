@@ -15,6 +15,10 @@ export enum SessionStatus {
 
 export interface SessionData {
   readonly sessionId: SessionId;
+  /** Stable Bedrock-side session UUID. Reused across HTTP/2 turns to preserve model memory. */
+  readonly bedrockSessionId: string;
+  /** Incremented each turn (starts at 1). Used to suppress re-greeting on Turn 2+. */
+  turnNumber: number;
   promptName: string;
   audioContentId: string;
   readonly inferenceConfig: InferenceConfig;
@@ -83,6 +87,8 @@ export function createSessionData(
 
   return {
     sessionId,
+    bedrockSessionId:      randomUUID(),
+    turnNumber:            1,
     promptName:            randomUUID(),
     audioContentId:        randomUUID(),
     inferenceConfig,

@@ -104,6 +104,7 @@ export class SessionUseCase {
     }
 
     session.streamGeneration       += 1;
+    session.turnNumber             += 1;
     session.isSessionStartSent      = false;
     session.promptName              = randomUUID();
     session.audioContentId          = randomUUID();
@@ -175,7 +176,7 @@ export class SessionUseCase {
     }
 
     const textConfig = request?.textConfig ?? DefaultTextConfiguration;
-    const content = request?.content ?? buildGermanTutorSystemPrompt(session.topic);
+    const content = request?.content ?? buildGermanTutorSystemPrompt(session.topic, session.turnNumber === 1);
 
     this.streaming.enqueueSystemPrompt(sessionId, content, textConfig);
     session.isSystemPromptSent = true;

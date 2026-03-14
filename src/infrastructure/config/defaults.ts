@@ -86,7 +86,7 @@ export const WeatherToolSchema = JSON.stringify({
  *
  * @param topic  Healthcare sub-topic, e.g. "General Health", "Medication".
  */
-export function buildGermanTutorSystemPrompt(topic: string): string {
+export function buildGermanTutorSystemPrompt(topic: string, isFirstTurn = true): string {
   return (
     // ── LANGUAGE RULE: first sentence — highest model attention ──────────────
     // This must stay at position 0.  Moving it later causes German output.
@@ -118,8 +118,11 @@ export function buildGermanTutorSystemPrompt(topic: string): string {
     `example: "That is interesting! Let us return to ${topic} for now."\n\n` +
 
     // ── Teaching flow ────────────────────────────────────────────────────────
-    `Open the lesson by greeting the student warmly in English and introducing ` +
-    `today's topic in one or two sentences. Then teach one German word or phrase ` +
+    (isFirstTurn
+      ? `Open the lesson by greeting the student warmly in English and introducing ` +
+        `today's topic in one or two sentences. Then teach one German word or phrase `
+      : `Continue the lesson naturally without re-introducing yourself or re-greeting. ` +
+        `Proceed with the next German word or phrase `) +
     `at a time using this pattern: say the German word or phrase clearly, give ` +
     `its English meaning in English, then use it in a short example sentence ` +
     `spoken in English. After each item, invite the student to repeat it aloud.\n\n` +
