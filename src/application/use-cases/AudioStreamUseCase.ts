@@ -33,6 +33,14 @@ export class AudioStreamUseCase {
   ) {}
 
   initQueue(sessionId: string): void {
+    // Deactivate any previous queue so in-flight processBatch stops
+    // before it can enqueue stale audio into the new stream.
+    const old = this.queues.get(sessionId);
+    if (old) {
+      old.isActive = false;
+      old.chunks = [];
+    }
+
     this.queues.set(sessionId, {
       chunks: [],
       isProcessing: false,

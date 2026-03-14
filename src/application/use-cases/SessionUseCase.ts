@@ -91,6 +91,18 @@ export class SessionUseCase {
   prepareNextStream(sessionId: string): void {
     const session = this.requireActiveSession(sessionId);
 
+    // Drain any leftover events from the previous turn so they are never
+    // sent on the new HTTP/2 stream (they would reference stale promptName
+    // / audioContentId values and cause Bedrock "No open content" errors).
+    const staleCount = session.queue.length;
+    if (staleCount > 0) {
+      session.queue.length = 0;
+      this.logger.warn("Drained stale queue events before next stream", {
+        sessionId,
+        drainedCount: staleCount,
+      });
+    }
+
     session.streamGeneration       += 1;
     session.isSessionStartSent      = false;
     session.promptName              = randomUUID();
@@ -98,6 +110,7 @@ export class SessionUseCase {
     session.isPromptStartSent       = false;
     session.isAudioContentStartSent = false;
     session.isSystemPromptSent      = false;
+    session.audioChunksSent         = 0;
 
     this.streaming.enqueueSessionStart(sessionId);
     this.streaming.enqueuePromptStart(sessionId);
