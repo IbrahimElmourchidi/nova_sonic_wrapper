@@ -469,6 +469,13 @@ export class BedrockStreamingService implements IStreamingService {
 
   enqueueAudioChunk(sessionId: string, audioData: Buffer): void {
     const session = this.requireSession(sessionId);
+
+    // Guard: drop audio that arrives before the audio content block is open.
+    // Between turns the Flutter recorder may still be streaming (gated)
+    // silent frames.  Sending audioInput without a prior contentStart
+    // causes Bedrock "No open content found" errors.
+    if (!session.isAudioContentStartSent) return;
+
     this.enqueue(sessionId, {
       event: {
         audioInput: {

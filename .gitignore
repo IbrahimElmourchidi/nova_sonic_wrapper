@@ -82,3 +82,4 @@ deployGCP.sh
 # Last session data
 lastSession.json
 nova_wrapper_key.pem
+flutter_app.txt
