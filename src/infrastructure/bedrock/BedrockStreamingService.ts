@@ -759,6 +759,9 @@ export class BedrockStreamingService implements IStreamingService {
     const session = this.sessions.findById(sessionId);
     if (!session) return;
 
+    // Reset per-turn speculative tracking.
+    session.speculativeContentIds.clear();
+
     const decoder = new TextDecoder();
     let chunkCount = 0;
     let audioOutputCount = 0;
@@ -889,6 +892,29 @@ export class BedrockStreamingService implements IStreamingService {
     }
 
     if (ev.contentStart) {
+      const cs = ev.contentStart as Record<string, unknown>;
+      // Bedrock uses "contentId" on response contentStart events.
+      const contentId = (cs.contentId ?? cs.contentName) as string | undefined;
+      // Track SPECULATIVE content blocks so we can suppress their audio.
+      if (contentId) {
+        let stage: string | undefined;
+        try {
+          const extra = typeof cs.additionalModelFields === "string"
+            ? JSON.parse(cs.additionalModelFields)
+            : cs.additionalModelFields;
+          stage = (extra as Record<string, unknown>)?.generationStage as string | undefined;
+        } catch { /* ignore parse errors */ }
+        if (stage === "SPECULATIVE") {
+          session.speculativeContentIds.add(contentId);
+          this.logger.debug("[GenerationStage] SPECULATIVE content block — audio will be suppressed", {
+            sessionId, contentId,
+          });
+        } else if (stage === "FINAL") {
+          this.logger.debug("[GenerationStage] FINAL content block — audio will be forwarded", {
+            sessionId, contentId,
+          });
+        }
+      }
       this.dispatchEvent(sessionId, "contentStart", ev.contentStart);
     } else if (ev.textOutput) {
       const textOut = ev.textOutput as Record<string, unknown>;
@@ -899,6 +925,14 @@ export class BedrockStreamingService implements IStreamingService {
       });
       this.dispatchEvent(sessionId, "textOutput", ev.textOutput);
     } else if (ev.audioOutput) {
+      const ao = ev.audioOutput as Record<string, unknown>;
+      // Bedrock uses "contentId" on contentStart but "contentName" on audioOutput —
+      // check both to be safe.
+      const audioContentId = (ao.contentId ?? ao.contentName) as string | undefined;
+      if (audioContentId && session.speculativeContentIds.has(audioContentId)) {
+        // Silently drop SPECULATIVE audio — only FINAL audio reaches the client.
+        return;
+      }
       this.dispatchEvent(sessionId, "audioOutput", ev.audioOutput);
     } else if (ev.toolUse) {
       this.dispatchEvent(sessionId, "toolUse", ev.toolUse);

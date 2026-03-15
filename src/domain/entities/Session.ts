@@ -57,6 +57,13 @@ export interface SessionData {
   /** True once a system prompt has been enqueued for the current prompt turn. */
   isSystemPromptSent: boolean;
 
+  /**
+   * contentIds whose generationStage is "SPECULATIVE".
+   * audioOutput events for these contentIds are suppressed — we only play
+   * FINAL audio so the SPECULATIVE→FINAL transition gap is never heard.
+   */
+  speculativeContentIds: Set<string>;
+
   // ── German tutor metadata ─────────────────────────────────────────────────
   /** Healthcare sub-topic for the lesson (e.g. "General Health"). */
   topic: string;
@@ -114,6 +121,7 @@ export function createSessionData(
     streamGeneration:      0,
     nextStreamPrepared:    false,
     isSystemPromptSent:    false,
+    speculativeContentIds: new Set(),
     topic,
     voiceId,
   };
