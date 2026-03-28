@@ -6,10 +6,20 @@ import type { ILogger } from "./ILogger";
 
 const { combine, timestamp, json, colorize, printf, errors } = winston.format;
 
+/** Returns a UTC HH:mm:ss.SSS string matching Flutter/iOS log format. */
+function utcHms(): string {
+  const d = new Date();
+  const h = String(d.getUTCHours()).padStart(2, "0");
+  const m = String(d.getUTCMinutes()).padStart(2, "0");
+  const s = String(d.getUTCSeconds()).padStart(2, "0");
+  const ms = String(d.getUTCMilliseconds()).padStart(3, "0");
+  return `${h}:${m}:${s}.${ms}`;
+}
+
 function createLogger(level: string, isProduction: boolean): winston.Logger {
   const devFormat = combine(
     errors({ stack: true }),
-    timestamp(),
+    timestamp({ format: () => utcHms() }),
     colorize(),
     printf(({ level, message, timestamp, ...meta }) => {
       const metaStr = Object.keys(meta).length
@@ -19,7 +29,7 @@ function createLogger(level: string, isProduction: boolean): winston.Logger {
     })
   );
 
-  const prodFormat = combine(errors({ stack: true }), timestamp(), json());
+  const prodFormat = combine(errors({ stack: true }), timestamp({ format: () => new Date().toISOString() }), json());
 
   return winston.createLogger({
     level,
